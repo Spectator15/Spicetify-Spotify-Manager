@@ -17,6 +17,7 @@ set "SPOTIFY_DIR=%LOCALAPPDATA%\Spotify"
 set "UPDATE_DIR=%LOCALAPPDATA%\Spotify\Update"
 set "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 set "CURRENT_USER_SID="
+set "DIAG_FILE=%TEMP%\Spicetify-Spotify-Manager-%RANDOM%-%RANDOM%-%RANDOM%.tmp"
 
 :MENU
 cls
@@ -105,6 +106,7 @@ if exist "%UPDATE_DIR%" (
         echo.
         echo ERROR: The Update path is a link, junction, or cannot be inspected safely.
         echo Refusing to change permissions because it may point outside the expected folder.
+        call :SHOW_DIAGNOSTIC
         echo.
         pause
         goto MENU
@@ -121,6 +123,7 @@ if exist "%UPDATE_DIR%\" (
         pause
         goto MENU
     )
+    call :CLEAR_DIAGNOSTIC
 )
 
 call :CLOSE_SPOTIFY
@@ -139,6 +142,7 @@ if exist "%UPDATE_DIR%" (
         echo.
         echo ERROR: Existing Update permissions could not be normalized safely.
         echo Try this option again as administrator if the folder was locked by another tool.
+        call :SHOW_DIAGNOSTIC
         echo.
         pause
         goto MENU
@@ -170,6 +174,7 @@ if errorlevel 1 (
     echo.
     echo ERROR: The new Update folder could not be verified as a normal folder.
     echo No locking permissions were applied.
+    call :SHOW_DIAGNOSTIC
     echo.
     pause
     goto MENU
@@ -178,23 +183,23 @@ if errorlevel 1 (
 rem Remove inherited entries, retain recovery access for well-known Windows
 rem system groups, give the signed-in user read access, then deny writes/deletes.
 set "LOCK_STEP=disable inherited permissions"
-icacls "%UPDATE_DIR%" /inheritance:r /L /Q >nul 2>&1
+call :RUN_ICACLS "%UPDATE_DIR%" /inheritance:r /L /Q
 if errorlevel 1 goto LOCK_FAILED
 
 set "LOCK_STEP=grant SYSTEM recovery access"
-icacls "%UPDATE_DIR%" /grant:r "*S-1-5-18:(OI)(CI)(F)" /L /Q >nul 2>&1
+call :RUN_ICACLS "%UPDATE_DIR%" /grant:r "*S-1-5-18:(OI)(CI)(F)" /L /Q
 if errorlevel 1 goto LOCK_FAILED
 
 set "LOCK_STEP=grant Administrators recovery access"
-icacls "%UPDATE_DIR%" /grant:r "*S-1-5-32-544:(OI)(CI)(F)" /L /Q >nul 2>&1
+call :RUN_ICACLS "%UPDATE_DIR%" /grant:r "*S-1-5-32-544:(OI)(CI)(F)" /L /Q
 if errorlevel 1 goto LOCK_FAILED
 
 set "LOCK_STEP=grant the current user read access"
-icacls "%UPDATE_DIR%" /grant:r "*%CURRENT_USER_SID%:(OI)(CI)(RX)" /L /Q >nul 2>&1
+call :RUN_ICACLS "%UPDATE_DIR%" /grant:r "*%CURRENT_USER_SID%:(OI)(CI)(RX)" /L /Q
 if errorlevel 1 goto LOCK_FAILED
 
 set "LOCK_STEP=deny the current user write and delete access"
-icacls "%UPDATE_DIR%" /deny "*%CURRENT_USER_SID%:(OI)(CI)(W,D)" /L /Q >nul 2>&1
+call :RUN_ICACLS "%UPDATE_DIR%" /deny "*%CURRENT_USER_SID%:(OI)(CI)(W,D)" /L /Q
 if errorlevel 1 goto LOCK_FAILED
 
 call :VERIFY_BLOCKED
@@ -217,11 +222,13 @@ goto MENU
 :LOCK_FAILED
 echo.
 echo ERROR: Could not %LOCK_STEP%.
+call :SHOW_DIAGNOSTIC
 echo Attempting to restore normal access so the folder is not left half-locked...
 call :RESTORE_UPDATE_PERMISSIONS
 if errorlevel 1 (
     echo WARNING: Automatic recovery also failed.
     echo Run option 3 as administrator to repair the Update folder permissions.
+    call :SHOW_DIAGNOSTIC
 ) else (
     echo Normal inherited permissions and user ownership were restored.
     echo Spotify updates remain unblocked.
@@ -273,6 +280,7 @@ if errorlevel 1 (
     echo.
     echo ERROR: The Update path is a link, junction, or cannot be inspected safely.
     echo Refusing to change permissions because it may point outside the expected folder.
+    call :SHOW_DIAGNOSTIC
     echo.
     pause
     goto MENU
@@ -288,6 +296,7 @@ if exist "%UPDATE_DIR%\" (
         pause
         goto MENU
     )
+    call :CLEAR_DIAGNOSTIC
 )
 
 call :CLOSE_SPOTIFY
@@ -305,6 +314,7 @@ if errorlevel 1 (
     echo.
     echo ERROR: The Update permissions could not be restored completely.
     echo Try this option again as administrator.
+    call :SHOW_DIAGNOSTIC
     echo.
     pause
     goto MENU
@@ -328,6 +338,7 @@ if exist "%UPDATE_DIR%\" (
         echo.
         echo ERROR: Permission restoration finished, but the access check failed.
         echo Try this option again as administrator before opening Spotify.
+        call :SHOW_DIAGNOSTIC
         echo.
         pause
         goto MENU
@@ -351,28 +362,27 @@ goto MENU
 
 :GET_CURRENT_USER_SID
 if defined CURRENT_USER_SID exit /b 0
-if not exist "%POWERSHELL_EXE%" exit /b 1
 for /f "tokens=2 delims=," %%I in ('whoami.exe /USER /FO CSV /NH 2^>nul') do if not defined CURRENT_USER_SID set "CURRENT_USER_SID=%%~I"
 if not defined CURRENT_USER_SID exit /b 1
 exit /b 0
 
 
 :CHECK_UPDATE_ITEM_SAFE
-"%POWERSHELL_EXE%" -NoProfile -Command "try { $item=Get-Item -LiteralPath $env:UPDATE_DIR -Force -ErrorAction Stop; if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { exit 1 }; exit 0 } catch { exit 1 }" >nul 2>&1
+call :RUN_POWERSHELL "try { $item=Get-Item -LiteralPath $env:UPDATE_DIR -Force -ErrorAction Stop; if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { [Console]::Error.WriteLine('The Update path is a reparse point.'); exit 1 }; exit 0 } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
 exit /b %ERRORLEVEL%
 
 
 :VERIFY_BLOCKED
-"%POWERSHELL_EXE%" -NoProfile -Command "try { $a=Get-Acl -LiteralPath $env:UPDATE_DIR -ErrorAction Stop; $s=$env:CURRENT_USER_SID; $n=[Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete; $r=[Security.AccessControl.FileSystemRights]::ReadAndExecute; $d=$u=$false; foreach ($x in $a.Access) { try { $i=$x.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }; if ($i -eq $s -and $x.AccessControlType -eq 'Deny' -and (($x.FileSystemRights -band $n) -eq $n)) { $d=$true }; if ($i -eq $s -and $x.AccessControlType -eq 'Allow' -and (($x.FileSystemRights -band $r) -eq $r)) { $u=$true } }; if ($a.AreAccessRulesProtected -and $d -and $u) { exit 0 } } catch {}; exit 1" >nul 2>&1
+call :RUN_POWERSHELL "try { $a=Get-Acl -LiteralPath $env:UPDATE_DIR -ErrorAction Stop; $s=$env:CURRENT_USER_SID; $n=[Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete; $r=[Security.AccessControl.FileSystemRights]::ReadAndExecute; $d=$u=$false; foreach ($x in $a.Access) { try { $i=$x.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }; if ($i -eq $s -and $x.AccessControlType -eq 'Deny' -and (($x.FileSystemRights -band $n) -eq $n)) { $d=$true }; if ($i -eq $s -and $x.AccessControlType -eq 'Allow' -and (($x.FileSystemRights -band $r) -eq $r)) { $u=$true } }; if ($a.AreAccessRulesProtected -and $d -and $u) { exit 0 }; [Console]::Error.WriteLine('The expected protected current-user ACL entries were not found.'); exit 1 } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
 if errorlevel 1 exit /b 1
-"%POWERSHELL_EXE%" -NoProfile -Command "try { $a=Get-Acl -LiteralPath $env:UPDATE_DIR -ErrorAction Stop; $f=[Security.AccessControl.FileSystemRights]::FullControl; $y=$z=$false; foreach ($x in $a.Access) { try { $i=$x.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }; if ($x.AccessControlType -eq 'Allow' -and (($x.FileSystemRights -band $f) -eq $f)) { if ($i -eq 'S-1-5-18') { $y=$true }; if ($i -eq 'S-1-5-32-544') { $z=$true } } }; if ($y -and $z) { exit 0 } } catch {}; exit 1" >nul 2>&1
+call :RUN_POWERSHELL "try { $a=Get-Acl -LiteralPath $env:UPDATE_DIR -ErrorAction Stop; $f=[Security.AccessControl.FileSystemRights]::FullControl; $y=$z=$false; foreach ($x in $a.Access) { try { $i=$x.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }; if ($x.AccessControlType -eq 'Allow' -and (($x.FileSystemRights -band $f) -eq $f)) { if ($i -eq 'S-1-5-18') { $y=$true }; if ($i -eq 'S-1-5-32-544') { $z=$true } } }; if ($y -and $z) { exit 0 }; [Console]::Error.WriteLine('The expected SYSTEM and Administrators recovery ACL entries were not found.'); exit 1 } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
 exit /b %ERRORLEVEL%
 
 
 :VERIFY_UNBLOCKED
-"%POWERSHELL_EXE%" -NoProfile -Command "try { $a=Get-Acl -LiteralPath $env:UPDATE_DIR -ErrorAction Stop; $s=$env:CURRENT_USER_SID; $o=([Security.Principal.NTAccount]$a.Owner).Translate([Security.Principal.SecurityIdentifier]).Value; if ($o -ne $s -or $a.AreAccessRulesProtected) { exit 1 }; foreach ($x in $a.Access) { try { $i=$x.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }; if ($i -eq $s -and $x.AccessControlType -eq 'Deny') { exit 1 } }; exit 0 } catch { exit 1 }" >nul 2>&1
+call :RUN_POWERSHELL "try { $a=Get-Acl -LiteralPath $env:UPDATE_DIR -ErrorAction Stop; $s=$env:CURRENT_USER_SID; $o=([Security.Principal.NTAccount]$a.Owner).Translate([Security.Principal.SecurityIdentifier]).Value; if ($o -ne $s) { [Console]::Error.WriteLine('The Update folder owner is not the current user.'); exit 1 }; if ($a.AreAccessRulesProtected) { [Console]::Error.WriteLine('ACL inheritance is still disabled on the Update folder.'); exit 1 }; foreach ($x in $a.Access) { try { $i=$x.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }; if ($i -eq $s -and $x.AccessControlType -eq 'Deny') { [Console]::Error.WriteLine('A current-user deny entry is still present on the Update folder.'); exit 1 } }; exit 0 } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
 if errorlevel 1 exit /b 1
-"%POWERSHELL_EXE%" -NoProfile -Command "try { $t=Join-Path $env:UPDATE_DIR ('.spicetify-manager-test-' + [guid]::NewGuid().ToString('N')); [IO.File]::WriteAllText($t,'test'); Remove-Item -LiteralPath $t -Force -ErrorAction Stop; exit 0 } catch { if ($t -and (Test-Path -LiteralPath $t)) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue }; exit 1 }" >nul 2>&1
+call :RUN_POWERSHELL "try { $t=Join-Path $env:UPDATE_DIR ('.spicetify-manager-test-' + [guid]::NewGuid().ToString('N')); [IO.File]::WriteAllText($t,'test'); Remove-Item -LiteralPath $t -Force -ErrorAction Stop; exit 0 } catch { if ($t -and (Test-Path -LiteralPath $t)) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue }; [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
 exit /b %ERRORLEVEL%
 
 
@@ -381,18 +391,51 @@ set "ICACLS_RECURSE="
 if exist "%UPDATE_DIR%\" set "ICACLS_RECURSE=/T"
 
 rem /L ensures a nested symbolic link is changed as a link, not followed.
-icacls "%UPDATE_DIR%" /remove:d "*%CURRENT_USER_SID%" %ICACLS_RECURSE% /C /L /Q >nul 2>&1
+call :RUN_ICACLS "%UPDATE_DIR%" /remove:d "*%CURRENT_USER_SID%" %ICACLS_RECURSE% /C /L /Q
 if errorlevel 1 exit /b 1
 
-icacls "%UPDATE_DIR%" /inheritance:e %ICACLS_RECURSE% /C /L /Q >nul 2>&1
+call :RUN_ICACLS "%UPDATE_DIR%" /inheritance:e %ICACLS_RECURSE% /C /L /Q
 if errorlevel 1 exit /b 1
 
-icacls "%UPDATE_DIR%" /reset %ICACLS_RECURSE% /C /L /Q >nul 2>&1
+call :RUN_ICACLS "%UPDATE_DIR%" /reset %ICACLS_RECURSE% /C /L /Q
 if errorlevel 1 exit /b 1
 
-icacls "%UPDATE_DIR%" /setowner "*%CURRENT_USER_SID%" %ICACLS_RECURSE% /C /L /Q >nul 2>&1
+call :RUN_ICACLS "%UPDATE_DIR%" /setowner "*%CURRENT_USER_SID%" %ICACLS_RECURSE% /C /L /Q
 if errorlevel 1 exit /b 1
 
+exit /b 0
+
+
+:RUN_ICACLS
+call :CLEAR_DIAGNOSTIC
+icacls %* >"%DIAG_FILE%" 2>&1
+set "DIAG_RESULT=%ERRORLEVEL%"
+if "%DIAG_RESULT%"=="0" call :CLEAR_DIAGNOSTIC
+exit /b %DIAG_RESULT%
+
+
+:RUN_POWERSHELL
+call :CLEAR_DIAGNOSTIC
+"%POWERSHELL_EXE%" -NoProfile -Command %* >"%DIAG_FILE%" 2>&1
+set "DIAG_RESULT=%ERRORLEVEL%"
+if "%DIAG_RESULT%"=="0" call :CLEAR_DIAGNOSTIC
+exit /b %DIAG_RESULT%
+
+
+:SHOW_DIAGNOSTIC
+if not defined DIAG_FILE exit /b 0
+if not exist "%DIAG_FILE%" exit /b 0
+for %%F in ("%DIAG_FILE%") do if %%~zF GTR 0 (
+    echo.
+    echo Windows reported:
+    type "%DIAG_FILE%"
+)
+call :CLEAR_DIAGNOSTIC
+exit /b 0
+
+
+:CLEAR_DIAGNOSTIC
+if defined DIAG_FILE if exist "%DIAG_FILE%" del /F /Q "%DIAG_FILE%" >nul 2>&1
 exit /b 0
 
 
@@ -440,5 +483,6 @@ exit /b 0
 
 
 :END
+call :CLEAR_DIAGNOSTIC
 endlocal
 exit /b
