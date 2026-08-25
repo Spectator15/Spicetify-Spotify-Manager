@@ -313,6 +313,64 @@ function Get-AclSddl {
     return $Acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
 }
 
+function Get-AclFingerprint {
+    param([Parameter(Mandatory = $true)]$Acl)
+    $accessRules = foreach ($rule in @($Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
+        '{0}|{1}|{2}|{3}|{4}|{5}' -f
+            $rule.IdentityReference.Value,
+            [int]$rule.AccessControlType,
+            [int64]$rule.FileSystemRights,
+            [int]$rule.InheritanceFlags,
+            [int]$rule.PropagationFlags,
+            [bool]$rule.IsInherited
+    }
+    $auditRules = try {
+        foreach ($rule in @($Acl.GetAuditRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
+            '{0}|{1}|{2}|{3}|{4}|{5}' -f
+                $rule.IdentityReference.Value,
+                [int]$rule.AuditFlags,
+                [int64]$rule.FileSystemRights,
+                [int]$rule.InheritanceFlags,
+                [int]$rule.PropagationFlags,
+                [bool]$rule.IsInherited
+        }
+    }
+    catch { @() }
+    $fingerprint = [ordered]@{
+        Owner = $Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        Group = $Acl.GetGroup([Security.Principal.SecurityIdentifier]).Value
+        AccessProtected = [bool]$Acl.AreAccessRulesProtected
+        AuditProtected = [bool]$Acl.AreAuditRulesProtected
+        AccessRules = @($accessRules | Sort-Object)
+        AuditRules = @($auditRules | Sort-Object)
+    }
+    return $fingerprint | ConvertTo-Json -Compress -Depth 4
+}
+
+function Get-SavedStateValue {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    $property = $State.PSObject.Properties[$Name]
+    if ($null -eq $property) { return '' }
+    return [string]$property.Value
+}
+
+function Test-AclMatchesSavedState {
+    param(
+        [Parameter(Mandatory = $true)]$Acl,
+        [Parameter(Mandatory = $true)]$State,
+        [ValidateSet('Original', 'Blocked')][string]$Kind
+    )
+    $fingerprint = Get-SavedStateValue -State $State -Name ($Kind + 'Fingerprint')
+    if (-not [string]::IsNullOrWhiteSpace($fingerprint)) {
+        return (Get-AclFingerprint $Acl) -eq $fingerprint
+    }
+    $sddl = Get-SavedStateValue -State $State -Name ($Kind + 'Sddl')
+    return -not [string]::IsNullOrWhiteSpace($sddl) -and (Get-AclSddl $Acl) -eq $sddl
+}
+
 function New-ManagerAccessRule {
     param(
         [Parameter(Mandatory = $true)][string]$Sid,
@@ -494,17 +552,16 @@ function Get-UpdateAccessStatus {
         return [pscustomobject]@{ State = 'Allowed'; Detail = 'Update directory is not present yet.' }
     }
     $acl = Get-DirectorySecurity $path
-    $currentSddl = Get-AclSddl $acl
     if ($null -ne $state) {
         try { Assert-StateMatchesCurrentContext $state $Context $sid }
         catch { return [pscustomobject]@{ State = 'Recovery required'; Detail = $_.Exception.Message } }
-        if ([string]$state.Phase -eq 'Blocked' -and [string]$state.BlockedSddl -eq $currentSddl -and (Test-ManagerAclRulesPresent $acl $sid)) {
+        if ([string]$state.Phase -eq 'Blocked' -and (Test-AclMatchesSavedState -Acl $acl -State $state -Kind Blocked) -and (Test-ManagerAclRulesPresent $acl $sid)) {
             return [pscustomobject]@{ State = 'Blocked'; Detail = 'Managed ACL is active.' }
         }
         if ([string]$state.Phase -eq 'Applying' -and (Test-ManagerAclRulesPresent $acl $sid)) {
             return [pscustomobject]@{ State = 'Recovery required'; Detail = 'Blocking was interrupted before the final state was recorded.' }
         }
-        if ([string]$state.OriginalSddl -eq $currentSddl) {
+        if (Test-AclMatchesSavedState -Acl $acl -State $state -Kind Original) {
             return [pscustomobject]@{ State = 'Recovery required'; Detail = 'Original ACL is present but stale manager state remains.' }
         }
         return [pscustomobject]@{ State = 'Recovery required'; Detail = 'The Update ACL changed after it was managed.' }
@@ -528,17 +585,16 @@ function Restore-SavedOriginalAcl {
     Assert-StateMatchesCurrentContext $State $Context $sid
     $path = Assert-SafeUpdateDirectory -Context $Context
     $currentAcl = Get-DirectorySecurity $path
-    $currentSddl = Get-AclSddl $currentAcl
-    $knownManagedState = $currentSddl -eq [string]$State.BlockedSddl -or
-        $currentSddl -eq [string]$State.OriginalSddl
+    $knownManagedState = (Test-AclMatchesSavedState -Acl $currentAcl -State $State -Kind Blocked) -or
+        (Test-AclMatchesSavedState -Acl $currentAcl -State $State -Kind Original)
     if (-not $Force -and -not $knownManagedState) {
         throw 'The Update ACL changed after blocking. Automatic restore stopped to avoid overwriting unrelated permission changes. Use the recovery option to restore the saved original ACL deliberately.'
     }
     $originalAcl = New-AclFromSddl ([string]$State.OriginalSddl)
     Set-DirectorySecurity $path $originalAcl
-    $verifiedSddl = Get-AclSddl (Get-DirectorySecurity $path)
-    if ($verifiedSddl -ne [string]$State.OriginalSddl) {
-        throw 'The original Update ACL was applied but exact restoration could not be verified.'
+    $verifiedAcl = Get-DirectorySecurity $path
+    if (-not (Test-AclMatchesSavedState -Acl $verifiedAcl -State $State -Kind Original)) {
+        throw 'The original Update ACL was applied but semantic restoration could not be verified.'
     }
     Test-UpdateFolderWritable -Path $path -ExpectedWritable $true | Out-Null
     Remove-ManagerStateFile (Get-ManagerStatePath 'Update')
@@ -564,7 +620,7 @@ function Invoke-BlockUpdatesCore {
             Test-UpdateFolderWritable -Path $path -ExpectedWritable $false | Out-Null
             return [pscustomobject]@{ Changed = $false; Message = 'Spotify updates are already blocked and the ACL was verified.' }
         }
-        if ([string]$existingState.OriginalSddl -eq (Get-AclSddl (Get-DirectorySecurity $path))) {
+        if (Test-AclMatchesSavedState -Acl (Get-DirectorySecurity $path) -State $existingState -Kind Original) {
             Remove-ManagerStateFile (Get-ManagerStatePath 'Update')
         }
         else {
@@ -597,7 +653,9 @@ function Invoke-BlockUpdatesCore {
         TargetPath = $path
         UserSid = $sid
         OriginalSddl = $originalSddl
+        OriginalFingerprint = Get-AclFingerprint $currentAcl
         BlockedSddl = Get-AclSddl $blockedAcl
+        BlockedFingerprint = Get-AclFingerprint $blockedAcl
         CreatedDirectory = $createdDirectory
         UpdatedUtc = (Get-Date).ToUniversalTime().ToString('o')
     }
@@ -619,8 +677,8 @@ function Invoke-BlockUpdatesCore {
         $blockError = $_
         try {
             Set-DirectorySecurity $path (New-AclFromSddl $originalSddl)
-            $restored = Get-AclSddl (Get-DirectorySecurity $path)
-            if ($restored -ne $originalSddl) { throw 'Exact ACL recovery verification failed.' }
+            $restored = Get-DirectorySecurity $path
+            if ((Get-AclFingerprint $restored) -ne [string]$state.OriginalFingerprint) { throw 'Semantic ACL recovery verification failed.' }
             Remove-ManagerStateFile (Get-ManagerStatePath 'Update')
             Write-ManagerLog "Blocking failed and the original ACL was restored: $($blockError.Exception.Message)" 'ERROR'
             throw "Could not block Spotify updates. The original permissions were restored. $($blockError.Exception.Message)"

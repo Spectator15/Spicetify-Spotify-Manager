@@ -197,7 +197,7 @@ try {
         $context = New-TestContext -Root $root -Installed -CreateUpdate
         $unrelatedPath = Join-Path $context.UpdateDirectory 'keep-me.txt'
         Set-Content -LiteralPath $unrelatedPath -Value 'preserve this file'
-        $originalSddl = Get-AclSddl (Get-Acl -LiteralPath $context.UpdateDirectory)
+        $originalFingerprint = Get-AclFingerprint (Get-Acl -LiteralPath $context.UpdateDirectory)
         Use-TestEnvironment -Root $root -Context $context
         $first = Invoke-BlockUpdatesCore $context
         Assert-True $first.Changed
@@ -208,7 +208,7 @@ try {
         Assert-Equal 'preserve this file' (Get-Content -LiteralPath $unrelatedPath -Raw).Trim()
         $allow = Invoke-AllowUpdatesCore $context
         Assert-True $allow.Changed
-        Assert-Equal $originalSddl (Get-AclSddl (Get-Acl -LiteralPath $context.UpdateDirectory))
+        Assert-Equal $originalFingerprint (Get-AclFingerprint (Get-Acl -LiteralPath $context.UpdateDirectory))
     }
 
     Invoke-Test 'does not close Spotify for an already-blocked menu action' {
@@ -289,10 +289,10 @@ try {
     Invoke-Test 'fails verification and rolls back a partial block' {
         $root = New-TestRoot
         $context = New-TestContext -Root $root -Installed -CreateUpdate
-        $originalSddl = Get-AclSddl (Get-Acl -LiteralPath $context.UpdateDirectory)
+        $originalFingerprint = Get-AclFingerprint (Get-Acl -LiteralPath $context.UpdateDirectory)
         Use-TestEnvironment -Root $root -Context $context -ExtraHooks @{ WriteProbe = { param($path) $true } }
         Assert-Throws { Invoke-BlockUpdatesCore $context } 'original permissions were restored'
-        Assert-Equal $originalSddl (Get-AclSddl (Get-Acl -LiteralPath $context.UpdateDirectory))
+        Assert-Equal $originalFingerprint (Get-AclFingerprint (Get-Acl -LiteralPath $context.UpdateDirectory))
         Assert-False (Test-Path -LiteralPath (Get-ManagerStatePath 'Update'))
     }
 
