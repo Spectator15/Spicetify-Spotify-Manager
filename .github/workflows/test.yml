@@ -1,0 +1,28 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-tests:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify generated release
+        shell: powershell
+        run: .\build\Build-Release.ps1 -Check
+
+      - name: Run Windows tests
+        shell: powershell
+        run: .\tests\Run-Tests.ps1
+
+      - name: Confirm the build made no changes
+        shell: powershell
+        run: git diff --exit-code -- Spicetify-Spotify-Manager.bat
