@@ -974,10 +974,10 @@ ssm_recover_workflow() {
         ssm_error "Saved recovery state does not match the currently detected Spotify installation."
         return 78
     fi
-    ssm_spotify_running && ssm_stop_spotify || true
+    if ssm_spotify_running; then ssm_stop_spotify || errors=1; fi
     ssm_restore_previous_control "$previous" || errors=1
     ssm_restore_write_access || errors=1
-    if [[ "$running" == 1 ]]; then ssm_start_spotify || errors=1; fi
+    if [[ "$running" == 1 ]] && ! ssm_spotify_running; then ssm_start_spotify || errors=1; fi
     if (( errors == 0 )); then
         ssm_remove_state workflow || return
         ssm_success "The interrupted workflow's update and running-state preferences were restored."

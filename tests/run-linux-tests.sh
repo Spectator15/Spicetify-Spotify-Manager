@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Test functions and test doubles are invoked indirectly by the harness.
+# shellcheck disable=SC2317,SC2329
 set -uo pipefail
 
 test_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
