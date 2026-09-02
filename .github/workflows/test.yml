@@ -26,3 +26,66 @@ jobs:
       - name: Confirm the build made no changes
         shell: powershell
         run: git diff --exit-code -- Spicetify-Spotify-Manager.bat
+
+      - name: Protect Windows release bytes and line endings
+        shell: powershell
+        run: |
+          $expected = '65C8546BFFF555A52599FD6D155358E8B14CAEDF6DC609AA7D704E0253D19599'
+          $actual = (Get-FileHash -LiteralPath .\Spicetify-Spotify-Manager.bat -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "Windows release SHA-256 changed: $actual" }
+          $text = [IO.File]::ReadAllText((Resolve-Path .\Spicetify-Spotify-Manager.bat))
+          if ($text -match '(?<!\r)\n') { throw 'Windows release contains a bare LF.' }
+
+  linux-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+
+      - name: Verify generated Linux release
+        run: ./build/build-linux-release.sh --check
+
+      - name: Run ShellCheck
+        run: shellcheck -x src/linux/core.sh src/linux/main.sh build/build-linux-release.sh tests/run-linux-tests.sh Spicetify-Spotify-Manager-Linux.sh
+
+      - name: Run Linux tests
+        run: ./tests/run-linux-tests.sh
+
+      - name: Protect generated files and platform line endings
+        run: |
+          git diff --exit-code -- Spicetify-Spotify-Manager-Linux.sh Spicetify-Spotify-Manager.bat
+          test -x Spicetify-Spotify-Manager-Linux.sh
+          ! LC_ALL=C grep -q $'\r' Spicetify-Spotify-Manager-Linux.sh
+          test "$(sha256sum Spicetify-Spotify-Manager.bat | cut -d' ' -f1)" = "65c8546bfff555a52599fd6d155358e8b14caedf6dc609aa7d704e0253d19599"
+
+  release-assets:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows-tests, linux-tests]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Validate versioned release files
+        run: |
+          test -f Spicetify-Spotify-Manager.bat
+          test -x Spicetify-Spotify-Manager-Linux.sh
+          test "$(./Spicetify-Spotify-Manager-Linux.sh --version | awk '{print $NF}')" = "${GITHUB_REF_NAME#v}"
+          sha256sum Spicetify-Spotify-Manager.bat Spicetify-Spotify-Manager-Linux.sh > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Upload validated release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.ref_name }}-release-files
+          path: |
+            Spicetify-Spotify-Manager.bat
+            Spicetify-Spotify-Manager-Linux.sh
+            SHA256SUMS
