@@ -2,6 +2,10 @@ name: Test
 
 on:
   push:
+    branches:
+      - '**'
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   pull_request:
 
 permissions:
@@ -64,28 +68,67 @@ jobs:
           ! LC_ALL=C grep -q $'\r' Spicetify-Spotify-Manager-Linux.sh
           test "$(sha256sum Spicetify-Spotify-Manager.bat | cut -d' ' -f1)" = "65c8546bfff555a52599fd6d155358e8b14caedf6dc609aa7d704e0253d19599"
 
-  release-assets:
-    if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     needs: [windows-tests, linux-tests]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-      - name: Validate versioned release files
+      - name: Validate stable tag and release files
         run: |
-          test -f Spicetify-Spotify-Manager.bat
-          test -x Spicetify-Spotify-Manager-Linux.sh
-          test "$(./Spicetify-Spotify-Manager-Linux.sh --version | awk '{print $NF}')" = "${GITHUB_REF_NAME#v}"
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            fail "Release tags must use stable semantic versioning such as v1.2.3."
+          fi
+          [[ "$(git cat-file -t "$GITHUB_REF_NAME")" == tag ]] || fail "$GITHUB_REF_NAME is not an annotated tag."
+          [[ "$(git rev-parse "$GITHUB_REF_NAME^{}")" == "$GITHUB_SHA" ]] || fail "$GITHUB_REF_NAME does not point to the workflow commit."
+          [[ -f Spicetify-Spotify-Manager.bat ]] || fail "The Windows release file is missing."
+          [[ -x Spicetify-Spotify-Manager-Linux.sh ]] || fail "The Linux release file is missing or is not executable."
+          tag_version=${GITHUB_REF_NAME#v}
+          windows_version=$(awk -F"'" '/^\$script:ManagerVersion = / { print $2; exit }' Spicetify-Spotify-Manager.bat)
+          linux_version=$(./Spicetify-Spotify-Manager-Linux.sh --version | awk '{print $NF}')
+          [[ "$windows_version" == "$tag_version" ]] || fail "Windows version $windows_version does not match tag $tag_version."
+          [[ "$linux_version" == "$tag_version" ]] || fail "Linux version $linux_version does not match tag $tag_version."
+          ./build/build-linux-release.sh --check
           sha256sum Spicetify-Spotify-Manager.bat Spicetify-Spotify-Manager-Linux.sh > SHA256SUMS
           sha256sum --check SHA256SUMS
 
-      - name: Upload validated release files
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ github.ref_name }}-release-files
-          path: |
-            Spicetify-Spotify-Manager.bat
-            Spicetify-Spotify-Manager-Linux.sh
-            SHA256SUMS
+      - name: Create stable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::error::A GitHub Release already exists for $GITHUB_REF_NAME. Refusing to replace its assets."
+            exit 1
+          fi
+          cat > RELEASE_NOTES.md <<EOF
+          Stable $GITHUB_REF_NAME contains the complete Windows manager and the package-aware Linux manager.
+
+          Windows and Ubuntu validation completed before publication. Linux support remains package-specific, and real graphical CachyOS, Flatpak Spotify, and visual Spicetify runtime testing may still be outstanding as documented in the README.
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            Spicetify-Spotify-Manager.bat \
+            Spicetify-Spotify-Manager-Linux.sh \
+            SHA256SUMS \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md \
+            --verify-tag
+          assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
+          for expected in Spicetify-Spotify-Manager.bat Spicetify-Spotify-Manager-Linux.sh SHA256SUMS; do
+            grep -Fqx "$expected" <<< "$assets" || {
+              echo "::error::Release asset is missing after upload: $expected"
+              exit 1
+            }
+          done
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
