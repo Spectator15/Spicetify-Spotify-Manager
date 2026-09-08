@@ -6,11 +6,12 @@
 set -uo pipefail
 
 readonly SSM_NAME="Spicetify Spotify Manager"
-readonly SSM_VERSION="1.1.0"
+readonly SSM_VERSION="1.2.0"
 readonly SSM_FLATPAK_ID="com.spotify.Client"
 readonly SSM_APT_PACKAGE="spotify-client"
 readonly SSM_INSTALLER_URL="https://raw.githubusercontent.com/spicetify/cli/main/install.sh"
 readonly SSM_STATE_SCHEMA="1"
+readonly SSM_LOG_MAX_BYTES="262144"
 
 SSM_MANUAL_SPOTIFY_PATH=""
 SSM_MANUAL_PREFS_PATH=""
@@ -25,11 +26,19 @@ SSM_SUPPORT="unsupported"
 SSM_CONTEXT_NOTE="Spotify was not detected."
 SSM_WORKFLOW_ACTIVE=0
 SSM_TEMP_DIR=""
+SSM_LOG_ACTIVE=0
+SSM_LOG_WARNING_SHOWN=0
 
-ssm_info() { printf '%s\n' "$*"; }
-ssm_success() { printf 'OK: %s\n' "$*"; }
-ssm_warn() { printf 'WARNING: %s\n' "$*" >&2; }
-ssm_error() { printf 'ERROR: %s\n' "$*" >&2; }
+ssm_log_failure_notice() {
+    (( SSM_LOG_ACTIVE == 0 && SSM_LOG_WARNING_SHOWN == 0 )) || return 0
+    SSM_LOG_WARNING_SHOWN=1
+    printf 'WARNING: The manager could not write its private log. The original operation result is unchanged.\n' >&2
+}
+
+ssm_info() { printf '%s\n' "$*"; ssm_log INFO "$*" || ssm_log_failure_notice; }
+ssm_success() { printf 'OK: %s\n' "$*"; ssm_log INFO "$*" || ssm_log_failure_notice; }
+ssm_warn() { printf 'WARNING: %s\n' "$*" >&2; ssm_log WARN "$*" || ssm_log_failure_notice; }
+ssm_error() { printf 'ERROR: %s\n' "$*" >&2; ssm_log ERROR "$*" || ssm_log_failure_notice; }
 
 ssm_have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -37,7 +46,8 @@ ssm_current_uid() { id -u; }
 
 ssm_require_non_root() {
     if [[ "$(ssm_current_uid)" == "0" ]]; then
-        ssm_error "Do not run the manager as root or through sudo. It requests privilege only for an exact operation that needs it."
+        # Root refusal must not create a root-owned log or state directory.
+        printf '%s\n' 'ERROR: Do not run the manager as root or through sudo. It requests privilege only for an exact operation that needs it.' >&2
         return 77
     fi
 }
@@ -80,6 +90,7 @@ ssm_path_within() {
 ssm_path_has_symlink_component() {
     local path=${1:?path required}
     local current="/" part
+    local -a parts
     [[ "$path" == /* ]] || return 0
     IFS='/' read -r -a parts <<< "${path#/}"
     for part in "${parts[@]}"; do
@@ -117,7 +128,7 @@ ssm_assert_safe_state_directory() {
         ssm_error "The manager state path contains a symlink: $parent"
         return 78
     fi
-    if [[ -e "$directory" && ( -L "$directory" || ! -d "$directory" ) ]]; then
+    if [[ -L "$directory" || ( -e "$directory" && ! -d "$directory" ) ]]; then
         ssm_error "The manager state path is a symlink or not a directory: $directory"
         return 78
     fi
@@ -140,6 +151,93 @@ ssm_assert_safe_state_directory() {
     printf '%s\n' "$directory"
 }
 
+ssm_log_path() {
+    printf '%s/manager.log\n' "$(ssm_state_directory)"
+}
+
+ssm_validate_log_file() {
+    local path=${1:?log path required} uid mode expected_parent actual_parent
+    [[ -e "$path" ]] || return 1
+    if [[ -L "$path" || ! -f "$path" ]]; then
+        printf 'ERROR: Unsafe manager log file: %s\n' "$path" >&2
+        return 78
+    fi
+    expected_parent=$(ssm_realpath_existing "$(ssm_state_directory)") || return 78
+    actual_parent=$(ssm_realpath_existing "${path%/*}") || return 78
+    if [[ "$expected_parent" != "$actual_parent" ]]; then
+        printf 'ERROR: The manager log escaped its state directory: %s\n' "$path" >&2
+        return 78
+    fi
+    uid=$(stat -c '%u' -- "$path") || return 78
+    mode=$(stat -c '%a' -- "$path") || return 78
+    if [[ "$uid" != "$(ssm_current_uid)" || "$mode" != 600 ]]; then
+        printf 'ERROR: The manager log must be owned by the current user with mode 0600: %s\n' "$path" >&2
+        return 78
+    fi
+}
+
+ssm_create_private_log() {
+    local directory=${1:?directory required} path=${2:?path required} temporary
+    temporary=$(mktemp -- "$directory/.manager.log.XXXXXX") || return
+    chmod 600 -- "$temporary" || { rm -f -- "$temporary"; return 1; }
+    if ! mv -n -- "$temporary" "$path"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if [[ -e "$temporary" ]]; then
+        rm -f -- "$temporary"
+        ssm_validate_log_file "$path"
+    fi
+}
+
+ssm_rotate_log_if_needed() {
+    local path=${1:?log path required} incoming=${2:?incoming size required} rotated size
+    rotated="$path.1"
+    size=$(stat -c '%s' -- "$path") || return
+    (( size + incoming <= SSM_LOG_MAX_BYTES )) && return 0
+    if [[ -e "$rotated" || -L "$rotated" ]]; then
+        ssm_validate_log_file "$rotated" || return
+        rm -f -- "$rotated" || return
+    fi
+    mv -- "$path" "$rotated" || return
+    ssm_create_private_log "${path%/*}" "$path"
+}
+
+ssm_log() {
+    local level=${1:?log level required} message=${2-} directory path line bytes result=0
+    (( SSM_LOG_ACTIVE == 0 )) || return 1
+    case "$level" in INFO|WARN|ERROR) ;; *) return 64;; esac
+    SSM_LOG_ACTIVE=1
+    message=${message//$'\r'/ }
+    message=${message//$'\n'/ }
+    message=${message//$'\t'/ }
+    ((${#message} <= 2048)) || message=${message:0:2048}
+    directory=$(ssm_assert_safe_state_directory) || result=$?
+    if (( result == 0 )); then
+        path="$directory/manager.log"
+        if [[ -e "$path" || -L "$path" ]]; then
+            ssm_validate_log_file "$path" || result=$?
+        else
+            ssm_create_private_log "$directory" "$path" || result=$?
+        fi
+    fi
+    if (( result == 0 )); then
+        line="$(date -u '+%Y-%m-%dT%H:%M:%SZ') [$level] $message"
+        bytes=$(printf '%s\n' "$line" | wc -c) || result=$?
+    fi
+    if (( result == 0 )); then
+        ssm_rotate_log_if_needed "$path" "$bytes" || result=$?
+    fi
+    if (( result == 0 )); then
+        ssm_validate_log_file "$path" || result=$?
+    fi
+    if (( result == 0 )); then
+        printf '%s\n' "$line" >> "$path" || result=$?
+    fi
+    SSM_LOG_ACTIVE=0
+    return "$result"
+}
+
 ssm_state_path() {
     local name=${1:?state name required}
     case "$name" in
@@ -151,9 +249,16 @@ ssm_state_path() {
 
 ssm_validate_state_file() {
     local path=${1:?path required} uid mode mode_value expected_parent actual_parent
-    [[ -e "$path" ]] || return 1
+    [[ -e "$path" || -L "$path" ]] || return 1
     if [[ -L "$path" || ! -f "$path" ]]; then
         ssm_error "Unsafe manager state file: $path"
+        return 78
+    fi
+    local directory
+    directory=$(ssm_state_directory) || return 78
+    if ssm_path_has_symlink_component "$directory" || [[ ! -d "$directory" ]] ||
+        [[ "$(stat -c '%u:%a' -- "$directory")" != "$(ssm_current_uid):700" ]]; then
+        ssm_error "Unsafe manager state directory: $directory"
         return 78
     fi
     expected_parent=$(ssm_realpath_existing "$(ssm_state_directory)") || return 78
@@ -176,7 +281,8 @@ ssm_write_state_atomic() {
     shift
     local directory path temporary entry key value
     directory=$(ssm_assert_safe_state_directory) || return
-    path="$directory/$name.state"
+    path=$(ssm_state_path "$name") || return
+    if [[ -e "$path" || -L "$path" ]]; then ssm_validate_state_file "$path" || return; fi
     temporary=$(mktemp -- "$directory/.${name}.state.XXXXXX") || return
     chmod 600 -- "$temporary" || { rm -f -- "$temporary"; return 1; }
     for entry in "$@"; do
@@ -198,7 +304,7 @@ ssm_write_state_atomic() {
 ssm_remove_state() {
     local path
     path=$(ssm_state_path "$1") || return
-    if [[ -e "$path" ]]; then
+    if [[ -e "$path" || -L "$path" ]]; then
         ssm_validate_state_file "$path" || return
         rm -f -- "$path"
     fi
@@ -206,9 +312,9 @@ ssm_remove_state() {
 
 ssm_read_state() {
     local name=${1:?state name required}
-    local path key value schema_seen=0
+    local path key value schema_seen=0 seen='|'
     path=$(ssm_state_path "$name") || return
-    [[ -e "$path" ]] || return 1
+    [[ -e "$path" || -L "$path" ]] || return 1
     ssm_validate_state_file "$path" || return
     SSM_STATE_KIND=""; SSM_STATE_SCOPE=""; SSM_STATE_OWNER=""
     SSM_STATE_TARGET=""; SSM_STATE_PHASE=""; SSM_STATE_PREVIOUS=""
@@ -216,6 +322,8 @@ ssm_read_state() {
     while IFS=$'\t' read -r key value || [[ -n "$key" ]]; do
         [[ -n "$key" && -n "${value+x}" ]] || { ssm_error "Malformed state file: $path"; return 78; }
         ssm_validate_text_value "$value" || { ssm_error "Malformed state value in $path"; return 78; }
+        [[ "$seen" != *"|$key|"* ]] || { ssm_error "Duplicate state key in $path"; return 78; }
+        seen+="$key|"
         case "$key" in
             schema) [[ "$value" == "$SSM_STATE_SCHEMA" ]] || { ssm_error "Unsupported state schema in $path"; return 78; }; schema_seen=1 ;;
             kind) SSM_STATE_KIND=$value ;;
@@ -231,6 +339,20 @@ ssm_read_state() {
         esac
     done < "$path"
     [[ "$schema_seen" == 1 ]] || { ssm_error "State schema is missing in $path"; return 78; }
+    local required
+    for required in kind scope owner target phase; do
+        [[ "$seen" == *"|$required|"* ]] || { ssm_error "State key '$required' is missing in $path"; return 78; }
+    done
+    [[ "$SSM_STATE_OWNER" == manager && -n "$SSM_STATE_KIND" && -n "$SSM_STATE_TARGET" ]] || return 78
+    if [[ "$name" == control ]]; then
+        [[ "$SSM_STATE_PHASE" == applying || "$SSM_STATE_PHASE" == blocked ]] || return 78
+    elif [[ "$name" == workflow ]]; then
+        for required in previous running launch path; do
+            [[ "$seen" == *"|$required|"* ]] || return 78
+        done
+        case "$SSM_STATE_PHASE" in preparing|allowing|updating|repairing|restoring) ;; *) return 78;; esac
+        case "$SSM_STATE_PREVIOUS" in blocked-manager|blocked-external|allowed|launcher-blocked|launcher-allowed|externally-managed|unavailable) ;; *) return 78;; esac
+    fi
 }
 
 ssm_read_os_release() {
@@ -273,15 +395,20 @@ ssm_first_package_spotify_path() {
     return 1
 }
 
-ssm_validate_spotify_resources() {
+ssm_validate_resource_directory() {
     local path=${1:?Spotify path required}
-    local allow_symlink=${2:-0}
     [[ "$path" == /* && -d "$path" && -d "$path/Apps" ]] || return 1
-    [[ -f "$path/Apps/xpui.spa" || -d "$path/Apps/xpui" ]] || return 1
-    if [[ "$allow_symlink" != 1 ]] && ssm_path_has_symlink_component "$path"; then
+    if ssm_path_has_symlink_component "$path/Apps"; then
         return 1
     fi
     ssm_realpath_existing "$path" >/dev/null
+}
+
+ssm_validate_spotify_resources() {
+    local path=${1:?Spotify path required}
+    ssm_validate_resource_directory "$path" || return 1
+    [[ ! -L "$path/Apps/xpui.spa" && ! -L "$path/Apps/xpui" ]] || return 1
+    [[ -f "$path/Apps/xpui.spa" || -d "$path/Apps/xpui" ]]
 }
 
 ssm_detect_context() {
@@ -407,6 +534,14 @@ ssm_detect_context() {
     elif (( nix_found == 1 )); then
         SSM_KIND="nix"; SSM_SCOPE="declarative"; SSM_CONTEXT_NOTE="Nix-managed Spotify should be configured declaratively with spicetify-nix."
     fi
+    # Keep a package-proven directory available for saved permission recovery
+    # after a failed repair, without declaring incomplete resources supported.
+    if [[ -z "$SSM_SPOTIFY_PATH" && -n "${path:-}" && ( "$SSM_KIND" == apt || "$SSM_KIND" == arch || "$SSM_KIND" == flatpak ) ]] &&
+        ssm_validate_resource_directory "$path"; then
+        if [[ "$SSM_KIND" != flatpak ]] || ssm_path_within "$path" "$location"; then
+            SSM_SPOTIFY_PATH=$(ssm_realpath_existing "$path")
+        fi
+    fi
     SSM_CONTEXT_READY=1
 }
 
@@ -468,7 +603,7 @@ ssm_launcher_skip_enabled() {
 
 ssm_start_spotify() {
     case "$SSM_KIND" in
-        flatpak) nohup flatpak run "$SSM_FLATPAK_ID" >/dev/null 2>&1 & ;;
+        flatpak) nohup flatpak run "--$SSM_SCOPE" "$SSM_FLATPAK_ID" >/dev/null 2>&1 & ;;
         launcher)
             local args=()
             ssm_launcher_skip_enabled && args+=(--skip-update)
@@ -489,14 +624,32 @@ ssm_start_spotify() {
 }
 
 ssm_flatpak_masked() {
-    local output result
+    local output result pattern id_pattern exact=1
     output=$(flatpak mask "--$SSM_SCOPE" 2>&1)
     result=$?
     if (( result != 0 )); then
         ssm_error "Could not read the Flatpak mask state: ${output:-no diagnostic output}"
         return 70
     fi
-    grep -Fqx -- "$SSM_FLATPAK_ID" <<< "$output"
+    while IFS= read -r pattern; do
+        [[ -n "$pattern" ]] || continue
+        if [[ "$pattern" == "$SSM_FLATPAK_ID" ]]; then exact=0; continue; fi
+        case "$pattern" in
+            runtime/*) continue ;;
+            app/*) id_pattern=${pattern#app/} ;;
+            *) id_pattern=$pattern ;;
+        esac
+        id_pattern=${id_pattern%%/*}
+        # Flatpak accepts partial-ref globs. Do not mistake a broader external
+        # Spotify mask for allowed updates or claim ownership of that pattern.
+        # shellcheck disable=SC2254 # Intentionally interpret the package manager's glob as a glob, never as shell code.
+        case "$SSM_FLATPAK_ID" in
+            $id_pattern)
+                ssm_error "A non-exact Spotify mask is externally managed: $pattern. Resolve it with Flatpak before automatic update control."
+                return 78 ;;
+        esac
+    done <<< "$output"
+    return "$exact"
 }
 
 ssm_apt_held() {
@@ -511,7 +664,7 @@ ssm_apt_held() {
 }
 
 ssm_control_owned_for_context() {
-    ssm_read_state control 2>/dev/null || return 1
+    # The caller has already validated and loaded the control record once.
     [[ "$SSM_STATE_OWNER" == manager && "$SSM_STATE_KIND" == "$SSM_KIND" && "$SSM_STATE_SCOPE" == "$SSM_SCOPE" && "$SSM_STATE_TARGET" == "$(ssm_control_target)" ]]
 }
 
@@ -525,7 +678,7 @@ ssm_control_target() {
 }
 
 ssm_update_state() {
-    local physically_allowed=1 query_result=0
+    local physically_allowed=1 query_result=0 state_result
     case "$SSM_KIND" in
         flatpak)
             ssm_flatpak_masked
@@ -546,10 +699,14 @@ ssm_update_state() {
             *) printf 'unknown\n'; return 70 ;;
         esac
     fi
-    if ssm_control_owned_for_context; then
-        if (( physically_allowed == 0 )); then printf 'blocked-manager\n'; else printf 'recovery-required\n'; fi
-    elif ssm_read_state control >/dev/null 2>&1; then
-        printf 'recovery-required\n'
+    ssm_read_state control
+    state_result=$?
+    if (( state_result == 0 )); then
+        if ssm_control_owned_for_context && [[ "$SSM_STATE_PHASE" == blocked ]] && (( physically_allowed == 0 )); then
+            printf 'blocked-manager\n'
+        else printf 'recovery-required\n'; fi
+    elif (( state_result != 1 )); then
+        printf 'recovery-required\n'; return "$state_result"
     elif (( physically_allowed == 0 )); then
         printf 'blocked-external\n'
     else
@@ -563,7 +720,8 @@ ssm_run_privileged() {
 }
 
 ssm_set_control_raw() {
-    local blocked=${1:?blocked value required} command_result=0
+    local blocked=${1:?blocked value required} command_result=0 query_result
+    [[ "$blocked" == 0 || "$blocked" == 1 ]] || return 64
     case "$SSM_KIND" in
         flatpak)
             if [[ "$blocked" == 1 ]]; then flatpak mask "--$SSM_SCOPE" "$SSM_FLATPAK_ID" || command_result=$?
@@ -578,11 +736,10 @@ ssm_set_control_raw() {
         *) ssm_error "Persistent package update control is unavailable for $(ssm_context_label)."; return 69 ;;
     esac
     (( command_result == 0 )) || return 70
-    if [[ "$blocked" == 1 ]]; then
-        case "$SSM_KIND" in flatpak) ssm_flatpak_masked;; apt) ssm_apt_held;; esac
-    else
-        case "$SSM_KIND" in flatpak) ! ssm_flatpak_masked;; apt) ! ssm_apt_held;; esac
-    fi
+    case "$SSM_KIND" in flatpak) ssm_flatpak_masked;; apt) ssm_apt_held;; esac
+    query_result=$?
+    (( query_result <= 1 )) || return "$query_result"
+    [[ ( "$blocked" == 1 && "$query_result" == 0 ) || ( "$blocked" == 0 && "$query_result" == 1 ) ]]
 }
 
 ssm_block_updates() {
@@ -734,8 +891,25 @@ ssm_spicetify_package_owner() {
     printf 'unknown\n'
 }
 
+ssm_validate_installer() {
+    local path=$1 size marker
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    size=$(stat -c '%s' -- "$path") || return 1
+    (( size >= 1024 && size <= 131072 )) || return 1
+    [[ "$(head -n 1 "$path")" == '#!/usr/bin/env sh' ]] || return 1
+    sh -n "$path" 2>/dev/null || return 1
+    # Match literal upstream shell expressions without evaluating them.
+    # shellcheck disable=SC2016
+    for marker in 'is_root()' 'notfound()' 'endswith_newline()' 'check()' \
+        'releases_uri=https://github.com/spicetify/cli/releases' \
+        'download_uri=$releases_uri/download/v$tag/spicetify-$tag-$target.tar.gz'; do
+        grep -Fq -- "$marker" "$path" || return 1
+    done
+    # Structural validation is not a signature or a pinned upstream checksum.
+}
+
 ssm_install_or_update_spicetify() {
-    local executable owner temp installer content
+    local executable owner temp installer effective_url
     executable=$(ssm_spicetify_executable || true)
     if [[ -n "$executable" ]]; then
         owner=$(ssm_spicetify_package_owner)
@@ -765,11 +939,11 @@ ssm_install_or_update_spicetify() {
     ssm_require_command curl || return
     temp=$(mktemp -d -- "${TMPDIR:-/tmp}/spicetify-manager-install.XXXXXX") || return
     SSM_TEMP_DIR=$temp; installer="$temp/install.sh"
-    if ! curl --fail --location --proto '=https' --tlsv1.2 --output "$installer" "$SSM_INSTALLER_URL"; then
+    if ! effective_url=$(curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --max-filesize 131072 --write-out '%{url_effective}' --output "$installer" "$SSM_INSTALLER_URL"); then
         ssm_error "The official installer download failed."; ssm_cleanup_temp; return 70
     fi
-    content=$(head -n 2 "$installer" 2>/dev/null || true)
-    if [[ ! -s "$installer" || "$content" != *"#!/usr/bin/env sh"* ]] || ! grep -Fq 'github.com/spicetify/cli/releases' "$installer"; then
+    if [[ "$effective_url" != "$SSM_INSTALLER_URL" ]] || ! ssm_validate_installer "$installer"; then
         ssm_error "The downloaded file did not match the expected official shell installer."; ssm_cleanup_temp; return 70
     fi
     ssm_info "Official source: $SSM_INSTALLER_URL"
@@ -777,15 +951,23 @@ ssm_install_or_update_spicetify() {
     if ! ssm_confirm "Run the saved official Spicetify installer now?"; then ssm_cleanup_temp; return 0; fi
     (cd -- "$temp" && sh "$installer") || { ssm_error "The saved official Spicetify installer failed."; ssm_cleanup_temp; return 70; }
     ssm_cleanup_temp
-    ssm_spicetify_executable >/dev/null || { ssm_error "The installer completed, but the Spicetify CLI was not found."; return 70; }
+    if ! executable=$(ssm_spicetify_executable) || ! "$executable" -v >/dev/null; then
+        ssm_error "The installer completed, but the Spicetify CLI failed verification."; return 70
+    fi
     ssm_success "Spicetify was installed from the official project and verified."
 }
 
 ssm_permissions_manifest_path() { ssm_state_path permissions; }
 
 ssm_prepare_write_access() {
+    ssm_validate_spotify_resources "$SSM_SPOTIFY_PATH" || { ssm_error "Unsafe Spotify resource path."; return 78; }
+    [[ ! -e "$(ssm_permissions_manifest_path)" && ! -L "$(ssm_permissions_manifest_path)" ]] || {
+        ssm_error "Existing permission recovery must finish before another repair."; return 78;
+    }
+    local unwritable
+    unwritable=$(find "$SSM_SPOTIFY_PATH/Apps" -xdev ! -writable -print -quit) || return 70
     if [[ -w "$SSM_SPOTIFY_PATH" && -w "$SSM_SPOTIFY_PATH/Apps" ]] &&
-        [[ -z "$(find "$SSM_SPOTIFY_PATH/Apps" -xdev ! -writable -print -quit 2>/dev/null)" ]]; then
+        [[ -z "$unwritable" ]]; then
         return 0
     fi
     case "$SSM_KIND:$SSM_SCOPE" in
@@ -793,20 +975,29 @@ ssm_prepare_write_access() {
         *) ssm_error "Spotify resources are not writable. Refusing privilege for this installation type."; return 77 ;;
     esac
     ssm_confirm "Temporarily grant write access only to '$SSM_SPOTIFY_PATH' and its Apps directory?" || return 77
-    local directory manifest temporary item mode uid gid
+    local directory manifest temporary listing item mode uid gid
     directory=$(ssm_assert_safe_state_directory) || return
     manifest="$directory/permissions.state"
     temporary=$(mktemp -- "$directory/.permissions.state.XXXXXX") || return
-    chmod 600 -- "$temporary" || return
-    printf 'schema\t%s\nkind\t%s\nscope\t%s\npath\t%s\n' "$SSM_STATE_SCHEMA" "$SSM_KIND" "$SSM_SCOPE" "$SSM_SPOTIFY_PATH" > "$temporary"
+    listing=$(mktemp -- "$directory/.permissions.paths.XXXXXX") || { rm -f -- "$temporary"; return 70; }
+    # A saved, checked traversal avoids hiding find failures in process substitution.
+    if ! { printf '%s\0' "$SSM_SPOTIFY_PATH" > "$listing" && find "$SSM_SPOTIFY_PATH/Apps" -xdev -print0 >> "$listing"; }; then
+        rm -f -- "$temporary" "$listing"; return 70
+    fi
+    printf 'schema\t%s\nkind\t%s\nscope\t%s\npath\t%s\n' "$SSM_STATE_SCHEMA" "$SSM_KIND" "$SSM_SCOPE" "$SSM_SPOTIFY_PATH" > "$temporary" || { rm -f -- "$temporary" "$listing"; return 70; }
+    # Removing the listing on an immediate error/return is safe, not an in-place rewrite.
+    # shellcheck disable=SC2094
     while IFS= read -r -d '' item; do
-        ssm_validate_text_value "$item" || { rm -f -- "$temporary"; ssm_error "A Spotify path contains unsupported control characters."; return 78; }
-        mode=$(stat -c '%a' -- "$item") || { rm -f -- "$temporary"; return 1; }
-        uid=$(stat -c '%u' -- "$item") || { rm -f -- "$temporary"; return 1; }
-        gid=$(stat -c '%g' -- "$item") || { rm -f -- "$temporary"; return 1; }
-        printf 'entry\t%s\t%s\t%s\t%s\n' "$mode" "$uid" "$gid" "$item" >> "$temporary"
-    done < <(printf '%s\0' "$SSM_SPOTIFY_PATH"; find "$SSM_SPOTIFY_PATH/Apps" -xdev -print0)
-    mv -f -- "$temporary" "$manifest" || return
+        if ! ssm_validate_text_value "$item" || ssm_path_has_symlink_component "$item" || [[ ! -f "$item" && ! -d "$item" ]]; then
+            rm -f -- "$temporary" "$listing"; ssm_error "Unsafe Spotify resource entry."; return 78
+        fi
+        local metadata
+        metadata=$(stat -c '%a %u %g' -- "$item") || { rm -f -- "$temporary" "$listing"; return 70; }
+        read -r mode uid gid <<< "$metadata"
+        printf 'entry\t%s\t%s\t%s\t%s\n' "$mode" "$uid" "$gid" "$item" >> "$temporary" || { rm -f -- "$temporary" "$listing"; return 70; }
+    done < "$listing"
+    rm -f -- "$listing"
+    mv -f -- "$temporary" "$manifest" || { rm -f -- "$temporary"; return 70; }
     ssm_run_privileged chmod a+rw "$SSM_SPOTIFY_PATH" || return
     ssm_run_privileged find "$SSM_SPOTIFY_PATH/Apps" -xdev ! -type l -exec chmod a+rwX -- '{}' + || return
     [[ -w "$SSM_SPOTIFY_PATH/Apps" ]] || { ssm_error "Temporary Spotify write access could not be verified."; return 77; }
@@ -815,10 +1006,19 @@ ssm_prepare_write_access() {
 ssm_restore_write_access() {
     local manifest key value mode saved_uid saved_gid item current_mode current_uid current_gid
     local -a entries=()
+    local headers='|' root_seen=0 apps_seen=0
+    local -A seen_entries=()
     manifest=$(ssm_permissions_manifest_path) || return
-    [[ -e "$manifest" ]] || return 0
+    [[ -e "$manifest" || -L "$manifest" ]] || return 0
     ssm_validate_state_file "$manifest" || return
+    # A failed repair may have removed xpui. Recovery needs the validated
+    # directories and matching saved manifest, not a complete application.
+    ssm_validate_resource_directory "$SSM_SPOTIFY_PATH" || return 78
     while IFS=$'\t' read -r key value saved_uid saved_gid item || [[ -n "$key" ]]; do
+        if [[ "$key" != entry ]]; then
+            [[ "$headers" != *"|$key|"* && -z "$saved_uid$saved_gid$item" ]] || return 78
+            headers+="$key|"
+        fi
         case "$key" in
             schema) [[ "$value" == "$SSM_STATE_SCHEMA" ]] || return 78 ;;
             kind) [[ "$value" == "$SSM_KIND" ]] || return 78 ;;
@@ -827,20 +1027,31 @@ ssm_restore_write_access() {
             entry)
                 mode=$value
                 [[ "$mode" =~ ^[0-7]{3,4}$ && "$saved_uid" =~ ^[0-9]+$ && "$saved_gid" =~ ^[0-9]+$ ]] || return 78
-                [[ -e "$item" && ! -L "$item" ]] || continue
+                [[ -n "$item" ]] && ssm_validate_text_value "$item" || return 78
+                ssm_path_has_symlink_component "$item" && return 78
+                [[ ! ${seen_entries["$item"]+present} ]] || return 78
+                seen_entries["$item"]=1
+                [[ "$item" != "$SSM_SPOTIFY_PATH" ]] || root_seen=1
+                [[ "$item" != "$SSM_SPOTIFY_PATH/Apps" ]] || apps_seen=1
+                # Deleted resources need no mode restoration; check ownership below.
+                [[ -e "$item" ]] || continue
                 if [[ "$item" != "$SSM_SPOTIFY_PATH" ]] && ! ssm_path_within "$item" "$SSM_SPOTIFY_PATH/Apps"; then
                     ssm_error "Permission recovery refused a path outside Spotify Apps: $item"; return 78
                 fi
+                [[ "$(stat -c '%u:%g' -- "$item")" == "$saved_uid:$saved_gid" ]] || { ssm_error "Resource ownership changed outside the manager: $item"; return 78; }
                 entries+=("$mode" "$saved_uid" "$saved_gid" "$item")
                 ;;
             *) ssm_error "Malformed permission recovery state."; return 78 ;;
         esac
     done < "$manifest"
-    ssm_run_privileged find "$SSM_SPOTIFY_PATH/Apps" -xdev ! -type l -exec chmod go-w -- '{}' + || return
+    for key in schema kind scope path; do [[ "$headers" == *"|$key|"* ]] || return 78; done
+    (( root_seen == 1 && apps_seen == 1 )) || return 78
+    # Restore only recorded entries. Do not remove permissions from unrelated new files.
     local index
     for ((index=0; index<${#entries[@]}; index+=4)); do
         mode=${entries[index]}; saved_uid=${entries[index+1]}; saved_gid=${entries[index+2]}; item=${entries[index+3]}
-        ssm_run_privileged chmod "$mode" "$item" || return
+        ssm_path_has_symlink_component "$item" && return 78
+        ssm_run_privileged chmod "$mode" -- "$item" || return
         current_mode=$(stat -c '%a' -- "$item") || return
         current_uid=$(stat -c '%u' -- "$item") || return
         current_gid=$(stat -c '%g' -- "$item") || return
@@ -878,7 +1089,11 @@ ssm_repair_spicetify() {
     ssm_configure_spicetify || return
     initial=$(ssm_spicetify_state)
     [[ "$initial" == applied ]] && { ssm_info "Spicetify already appears applied to the current Spotify version."; return 0; }
-    ssm_prepare_write_access || return
+    ssm_prepare_write_access || {
+        result=$?
+        ssm_restore_write_access || ssm_error "Temporary access recovery still needs attention."
+        return "$result"
+    }
     if ! "$executable" backup apply --no-restart; then
         ssm_warn "Normal backup/apply failed. Trying the official restore, backup and apply recovery sequence."
         "$executable" restore backup apply --no-restart || result=$?
@@ -970,9 +1185,19 @@ ssm_recover_workflow() {
     ssm_read_state workflow || return
     previous=$SSM_STATE_PREVIOUS; running=$SSM_STATE_RUNNING; kind=$SSM_STATE_KIND; scope=$SSM_STATE_SCOPE; spotify_path=$SSM_STATE_PATH
     ssm_info "Recovering interrupted stage: ${SSM_STATE_PHASE:-unknown} (${SSM_STATE_LAUNCH:-unknown launch method})."
-    if [[ "$kind" != "$SSM_KIND" || "$scope" != "$SSM_SCOPE" || "$spotify_path" != "$SSM_SPOTIFY_PATH" ]]; then
+    if [[ "$kind" != "$SSM_KIND" || "$scope" != "$SSM_SCOPE" || "$SSM_STATE_TARGET" != "$(ssm_control_target)" ]]; then
         ssm_error "Saved recovery state does not match the currently detected Spotify installation."
         return 78
+    fi
+    if [[ "$spotify_path" != "$SSM_SPOTIFY_PATH" ]]; then
+        # Flatpak switches deployment directories after an update. Only rediscovered
+        # package metadata may authorize that path change, never a manual path.
+        if [[ "$kind" == flatpak && "$SSM_CONTEXT_READY" == 1 && "$SSM_SUPPORT" == full ]] &&
+            ssm_validate_spotify_resources "$SSM_SPOTIFY_PATH"; then
+            :
+        else
+            ssm_error "Saved recovery path does not match the installation."; return 78
+        fi
     fi
     if ssm_spotify_running; then ssm_stop_spotify || errors=1; fi
     ssm_restore_previous_control "$previous" || errors=1
@@ -1002,12 +1227,14 @@ ssm_signal_handler() {
     trap - INT TERM HUP
     ssm_warn "Received $signal. Attempting transaction recovery."
     ssm_cleanup_temp
-    if (( SSM_WORKFLOW_ACTIVE == 1 )); then ssm_recover_workflow || true; fi
+    if (( SSM_WORKFLOW_ACTIVE == 1 )); then ssm_recover_workflow || true
+    else ssm_restore_write_access || ssm_error "Permission recovery still needs attention."; fi
     exit "$code"
 }
 
 ssm_guided_update() {
     local previous was_running=0 launch result=0 final query_result
+    local original_kind=$SSM_KIND original_scope=$SSM_SCOPE original_path=$SSM_SPOTIFY_PATH
     case "$SSM_SUPPORT" in full|repair-only|launch-control) ;; *) ssm_error "$SSM_CONTEXT_NOTE"; return 69;; esac
     [[ ! -e "$(ssm_state_path workflow)" ]] || { ssm_error "An incomplete workflow already needs recovery."; return 78; }
     previous=$(ssm_update_state)
@@ -1016,6 +1243,7 @@ ssm_guided_update() {
     [[ "$previous" != recovery-required ]] || { ssm_error "Resolve update-control recovery before starting."; return 78; }
     [[ "$SSM_KIND" != launcher ]] || { [[ "$previous" == blocked-manager ]] && previous=launcher-blocked || previous=launcher-allowed; }
     ssm_spotify_running && was_running=1
+    if (( was_running == 1 )); then ssm_confirm "Close Spotify for the guided update?" || return 64; fi
     launch=$SSM_KIND
     ssm_save_workflow preparing "$previous" "$was_running" "$launch" || return
     SSM_WORKFLOW_ACTIVE=1
@@ -1023,21 +1251,30 @@ ssm_guided_update() {
     trap 'ssm_signal_handler SIGTERM 143' TERM
     trap 'ssm_signal_handler SIGHUP 129' HUP
     if (( was_running == 1 )); then
-        ssm_confirm "Close Spotify for the guided update?" || { result=64; }
-        (( result != 0 )) || ssm_stop_spotify || result=$?
+        ssm_stop_spotify || result=$?
     fi
     if (( result == 0 )); then
         ssm_save_workflow allowing "$previous" "$was_running" "$launch" || result=$?
-        case "$previous" in blocked-manager|blocked-external) ssm_set_control_raw 0 || result=$?;; launcher-blocked) ssm_remove_state control || result=$?;; esac
+        if (( result == 0 )); then
+            case "$previous" in blocked-manager|blocked-external) ssm_set_control_raw 0 || result=$?;; launcher-blocked) ssm_remove_state control || result=$?;; esac
+        fi
     fi
     if (( result == 0 )); then
         ssm_save_workflow updating "$previous" "$was_running" "$launch" || result=$?
-        ssm_package_update || result=$?
+        (( result != 0 )) || ssm_package_update || result=$?
     fi
     if (( result == 0 )); then
         ssm_detect_context
-        ssm_save_workflow repairing "$previous" "$was_running" "$launch" || result=$?
-        if ssm_spicetify_executable >/dev/null; then ssm_repair_spicetify || result=$?; else ssm_warn "Spicetify is not installed, so no repair was run."; fi
+        if [[ "$SSM_KIND" != "$original_kind" || "$SSM_SCOPE" != "$original_scope" || "$SSM_SUPPORT" == unsupported ]]; then
+            ssm_error "The installation identity changed during the update. Refusing repair of a different target."
+            SSM_KIND=$original_kind; SSM_SCOPE=$original_scope; SSM_SPOTIFY_PATH=$original_path
+            result=78
+        else
+            ssm_save_workflow repairing "$previous" "$was_running" "$launch" || result=$?
+            if (( result == 0 )); then
+                if ssm_spicetify_executable >/dev/null; then ssm_repair_spicetify || result=$?; else ssm_warn "Spicetify is not installed, so no repair was run."; fi
+            fi
+        fi
     fi
     ssm_save_workflow restoring "$previous" "$was_running" "$launch" || result=$?
     if ssm_spotify_running && ! ssm_stop_spotify; then result=75; fi
@@ -1059,6 +1296,8 @@ ssm_guided_update() {
     fi
     if (( result == 0 )); then
         ssm_remove_state workflow || result=$?
+    fi
+    if (( result == 0 )); then
         SSM_WORKFLOW_ACTIVE=0; trap - INT TERM HUP
         ssm_success "The guided Spotify update and Spicetify check completed, and the final update state was verified."
         return 0
@@ -1075,10 +1314,11 @@ ssm_guided_update() {
 
 ssm_recovery_present() {
     local update query_result
-    [[ -e "$(ssm_state_path workflow)" || -e "$(ssm_state_path permissions)" ]] && return 0
+    [[ -e "$(ssm_state_path workflow)" || -L "$(ssm_state_path workflow)" || -e "$(ssm_state_path permissions)" || -L "$(ssm_state_path permissions)" ]] && return 0
+    if (( $# )); then [[ "$1" == recovery-required || "$1" == unknown* ]]; return; fi
     update=$(ssm_update_state 2>/dev/null)
     query_result=$?
-    (( query_result == 0 )) && [[ "$update" == recovery-required ]]
+    (( query_result != 0 )) || [[ "$update" == recovery-required ]]
 }
 
 ssm_show_status() {
@@ -1092,7 +1332,7 @@ ssm_show_status() {
     update=$(ssm_update_state)
     query_result=$?
     if (( query_result != 0 )); then update="unknown (state query failed)"; status_result=3; fi
-    ssm_recovery_present && recovery="attention required"
+    ssm_recovery_present "$update" && recovery="attention required"
     printf '\n%s %s\n' "$SSM_NAME" "$SSM_VERSION"
     printf '  Distribution:  %s\n' "$SSM_DISTRO"
     printf '  Spotify:       %s\n' "$(ssm_context_label)"
@@ -1112,6 +1352,7 @@ ssm_show_diagnostics() {
     ssm_show_status || true
     printf '\nDiagnostics\n'
     printf '  State dir:     %s\n' "$(ssm_state_directory)"
+    printf '  Private log:   %s\n' "$(ssm_log_path)"
     printf '  Preferences:   %s\n' "${SSM_PREFS_PATH:-not available}"
     printf '  Bash:          %s\n' "$BASH_VERSION"
     printf '  Commands:      '
@@ -1140,6 +1381,9 @@ EOF
 
 ssm_show_menu() {
     while true; do
+        trap 'ssm_signal_handler SIGINT 130' INT
+        trap 'ssm_signal_handler SIGTERM 143' TERM
+        trap 'ssm_signal_handler SIGHUP 129' HUP
         ssm_detect_context
         ssm_recovery_present && {
             ssm_warn "Managed recovery state exists. Recovery must be resolved before normal actions."
@@ -1158,6 +1402,10 @@ ssm_show_menu() {
 EOF
         local choice result=0
         read -r -p "Select an action: " choice || return 0
+        if [[ "$choice" != 6 && "$choice" != 7 ]] && ssm_recovery_present; then
+            ssm_error "Resolve recovery before starting another action. Diagnostics and Exit remain available."
+            continue
+        fi
         case "$choice" in
             1) ssm_guided_update || result=$? ;;
             2) ssm_install_or_update_spicetify || result=$? ;;
@@ -1184,7 +1432,12 @@ EOF
 ssm_main() {
     local action="menu"
     local result
+    local action_seen=0
     while (($#)); do
+        case "$1" in --help|-h|--version|-V|--status)
+            (( action_seen == 0 )) || { ssm_error "Choose only one command-line action."; return 64; }
+            action_seen=1 ;;
+        esac
         case "$1" in
             --help|-h) action="help"; shift ;;
             --version|-V) action="version"; shift ;;
@@ -1203,6 +1456,7 @@ ssm_main() {
             *) ssm_error "Unknown option: $1"; ssm_print_help >&2; return 64 ;;
         esac
     done
+    (( $# == 0 )) || { ssm_error "Unexpected positional arguments."; return 64; }
     case "$action" in
         help) ssm_print_help ;;
         version) printf '%s %s\n' "$SSM_NAME" "$SSM_VERSION" ;;
@@ -1217,6 +1471,9 @@ ssm_main() {
             ssm_require_non_root
             result=$?
             (( result == 0 )) || return "$result"
+            trap 'ssm_signal_handler SIGINT 130' INT
+            trap 'ssm_signal_handler SIGTERM 143' TERM
+            trap 'ssm_signal_handler SIGHUP 129' HUP
             ssm_detect_context
             ssm_show_menu
             ;;

@@ -25,9 +25,9 @@ Both ready-to-run files show the current Spotify, Spicetify, process, and update
 
 ## Download and usage
 
-The stable `v1.1.0` release contains separate complete files for Windows and Linux:
+The latest published stable release is `v1.1.0` and contains separate complete files for Windows and Linux. The `1.2.0` changes described below are pending review and are not yet included in those downloads:
 
-- [Download the Windows manager](https://github.com/Spectator15/Spicetify-Spotify-Manager/releases/latest/download/Spicetify-Spotify-Manager.bat)
+- [Download the published Windows 1.1 manager](https://github.com/Spectator15/Spicetify-Spotify-Manager/releases/latest/download/Spicetify-Spotify-Manager.bat)
 - [Download the Linux manager](https://github.com/Spectator15/Spicetify-Spotify-Manager/releases/latest/download/Spicetify-Spotify-Manager-Linux.sh)
 
 ### Windows
@@ -35,7 +35,21 @@ The stable `v1.1.0` release contains separate complete files for Windows and Lin
 > [!IMPORTANT]
 > The Windows manager supports the normal standalone desktop client downloaded from `spotify.com`. The Microsoft Store version is detected but is not modified.
 
-Run `Spicetify-Spotify-Manager.bat` normally, not as administrator. Windows PowerShell 5.1 is required. Normal Spicetify commands are never run elevated. If Windows denies a permission change, the manager can request administrator approval for that specific ACL retry only.
+The pending `1.2.0` Windows download is `Spicetify-Spotify-Manager.exe`, replacing the BAT entry point. It is generated from repository source but has not been published; the link above still downloads the older `1.1.0` BAT. The following Windows instructions describe `1.2.0`.
+
+Run `Spicetify-Spotify-Manager.exe` normally, not as administrator. It uses .NET Framework 4.8 and Windows PowerShell 5.1, included in current Windows 10/11 installations. No separate .NET SDK, PowerShell 7 installation, or companion files are needed. Normal Spicetify commands are never run elevated. If Windows denies a permission change, the manager can request administrator approval for that specific ACL retry only.
+
+Windows also provides read-only command-line options for diagnostics and monitoring:
+
+```powershell
+.\Spicetify-Spotify-Manager.exe --help
+.\Spicetify-Spotify-Manager.exe --version
+.\Spicetify-Spotify-Manager.exe --status
+```
+
+`--status` returns `0` when the supported standalone Spotify client is detected and `3` when it is missing or only the unsupported Microsoft Store client is found. Invalid arguments return `64`, and an operational status failure returns `70`. These modes do not clear the screen, prompt for input, open the menu, or change manager state.
+
+The console executable hosts the readable PowerShell implementation in memory. The native argument array is passed directly through PowerShell's parameter-binding API, without a command string, CMD, or an extracted CLI script. Characters already expanded by the caller's shell cannot be recovered, so use that shell's normal quoting when invoking any executable. Invalid arguments are treated as data and rejected. The existing, separately integrity-checked elevated ACL helper is unchanged.
 
 ### Linux
 
@@ -104,11 +118,17 @@ spicetify restore backup apply --no-restart
 
 On Flatpak, the manager masks only `com.spotify.Client` in the detected user or system scope. On APT, it holds only `spotify-client`. A mask or hold that existed before the manager is labelled external and is never removed by the normal **Allow Spotify updates** action.
 
+Broader Flatpak masks that match Spotify must be managed outside this utility. It refuses automatic control of those patterns instead of reporting that updates are allowed or removing an external mask.
+
 On Linux, managed state is stored under `${XDG_STATE_HOME}/spicetify-spotify-manager`, or `~/.local/state/spicetify-spotify-manager` when `XDG_STATE_HOME` is unset. Files are written atomically with private permissions. Symlinked, unexpectedly owned, group-writable, world-writable, malformed, or mismatched state is refused.
+
+The Linux diagnostic log is `${XDG_STATE_HOME}/spicetify-spotify-manager/manager.log`, with the same fallback directory. It uses timestamped `INFO`, `WARN`, and `ERROR` entries, mode `0600`, and a conservative size limit with one private rotated copy. Unsafe log paths are refused, and a logging failure never replaces the original operation result.
 
 The guided workflow records its package type, scope, previous control state, previous Spotify running state, launch method, path, and current stage before changing anything. `SIGINT`, `SIGTERM`, and `SIGHUP` trigger cleanup and an attempt to restore the previous update state. If recovery cannot finish, valid state remains for the next run and the manager offers recovery before normal actions.
 
 When Spicetify needs write access to system-owned Spotify resources, the Linux manager validates the exact installation first and records modes and ownership. Any broader write bits are temporary, apply only to the exact Spotify resource root and its `Apps` directory, and are restored after the operation. No recursive permission command targets a parent directory or an unrelated application.
+
+Run only one manager operation at a time. Do not change package controls or Spotify resource permissions from another tool during a workflow. Resource symlinks and incomplete permission manifests are refused, and restoration leaves newly created, unrecorded files alone. If recovery is deferred or fails, resolve it before starting another action.
 
 The manager never deletes Spotify data, login information, playlists, preferences, Spicetify configuration, themes, extensions, or Marketplace files. It does not access Spotify passwords, account information, credentials, or tokens, and it includes no telemetry or analytics.
 
@@ -119,9 +139,13 @@ The manager never deletes Spotify data, login information, playlists, preference
 
 Before blocking, the Windows manager records the directory's exact original security descriptor under `%LOCALAPPDATA%\SpicetifySpotifyManager`. It then adds known SID-based rules for the current user, `SYSTEM`, and `Administrators`. The current user keeps read and execute access while explicit write and delete access is denied. Inherited and unrelated permissions are restored from the saved descriptor instead of being guessed later.
 
-Both block and allow actions verify the final ACL and perform a real write-access probe. Repeating either action is safe. If blocking fails partway through, the manager attempts to restore the original ACL immediately and reports the underlying Windows error.
+Both block and allow actions verify the final ACL and perform a real write-access probe. Repeating either action is safe. If blocking fails partway through, the manager attempts to restore the original ACL immediately and reports the underlying Windows error. Permission-related elevation decisions use structured exception types, PowerShell error categories, `HResult` values, and Win32 codes rather than matching English error text.
 
 If the manager is interrupted or detects that another tool changed the ACL, it shows a recovery state instead of silently overwriting those changes. The recovery menu can deliberately restore the saved original ACL after confirmation. A concise diagnostic log is stored at `%LOCALAPPDATA%\SpicetifySpotifyManager\manager.log`.
+
+When a Windows ACL write is denied, only a small ACL helper is elevated. The parent creates it in a GUID-named private temporary directory and supplies its SHA-256. The elevated bootstrap reads the helper once as bytes, hashes those bytes, and creates the executed script block from the same verified in-memory bytes. A mismatch stops before any ACL mutation. The helper independently revalidates the exact Spotify `Update` path, action, result path, and expected security descriptor. It never launches Spicetify.
+
+Both normal and elevated ACL writes use the same directory-handle implementation. It opens and validates each ancestor without following reparse points, retains sharing locks, and writes and verifies permissions through the validated directory handle. If those handles cannot be obtained, it fails without a path-based fallback. These short-lived locks prevent directory substitution during that operation; they do not prevent another authorised process from editing an ACL or changing state between separate operations. Run only one manager operation at a time. Existing audit rules are left untouched.
 
 ## Spicetify installation
 
@@ -129,11 +153,15 @@ The manager does not replace a package-managed Spicetify installation with anoth
 
 When the Linux CLI is missing, the manager downloads the exact [official Spicetify installer](https://raw.githubusercontent.com/spicetify/cli/main/install.sh) over HTTPS into a private temporary directory. It fails on HTTP errors, checks the expected shell source, displays the source URL, asks for confirmation, executes the saved local file, and cleans it afterward. It never runs remote content through `curl | sh` itself. Marketplace is preserved and is not installed or modified unless the user explicitly accepts the separate upstream installer prompt.
 
+Linux also checks response size, shell syntax, expected structure and the final download URL. These checks can reject an unexpected response, but they are not a signature or a guarantee about upstream content.
+
+Windows follows the same download-first principle for the exact [official PowerShell installer](https://raw.githubusercontent.com/spicetify/cli/main/install.ps1). It requires HTTPS and the expected official host and path, rejects unexpected response types and sizes, parses the saved PowerShell, and checks stable installer structure plus official Spicetify release references before execution. This is stronger content validation, not certificate pinning or a cryptographic guarantee about the moving upstream `main` branch. The installed `spicetify.exe` must then pass its version command.
+
 If the current Spotify version is newer than Spicetify supports, the official Spicetify command may refuse to apply. The manager shows that diagnostic and does not claim success.
 
 ## Development and validation
 
-Normal users need only one platform file from the release. The committed root files are generated deterministically from editable source under `src`. Developers should edit the source, not the generated files.
+Normal users need only one platform file from the release. The committed root files are generated deterministically from editable source under `src`. Developers should edit the source, not the generated files. Both generated files receive the same project version from [`VERSION`](VERSION), and release notes are kept in [`CHANGELOG.md`](CHANGELOG.md).
 
 Build and test Windows from Windows PowerShell 5.1:
 
@@ -142,6 +170,10 @@ Build and test Windows from Windows PowerShell 5.1:
 .\build\Build-Release.ps1 -Check
 .\tests\Run-Tests.ps1
 ```
+
+`build/Build-Release.ps1` normalizes the editable PowerShell and `src/Launcher.cs` inputs to LF, embeds the manager source and shared version as assembly resources, and compiles an AnyCPU .NET Framework console executable. It uses Roslyn's `/deterministic+`, `/pathmap`, fixed compiler options and explicit reference assemblies, with no debug/PDB output. The PowerShell source remains authoritative and is compared byte-for-byte with the embedded resource in tests.
+
+Build-time packages are listed with exact versions and SHA-256 hashes in `build/windows-toolchain.json`: Microsoft's C# compiler, .NET Framework 4.8 reference assemblies, and Windows PowerShell 5 reference assemblies. The builder downloads only those packages from `api.nuget.org`, verifies their hashes on every build, and extracts them afresh in a disposable build directory. Only the generated EXE is distributed, not these packages. The archive cache defaults to `%TEMP%\SpicetifySpotifyManager-build-cache`; `-ToolCache <directory>` selects another cache. The first build needs network access, while a populated verified cache permits offline builds. No global SDK installation is performed. `-Check` compiles afresh and compares the EXE bytes without replacing the release file.
 
 Build and test Linux with Bash and ShellCheck:
 
@@ -156,7 +188,9 @@ The Linux tests use disposable Spotify-shaped directories and fake executables p
 
 WSL and Ubuntu automation do not prove graphical Spotify behaviour on every distribution. Real CachyOS, Flatpak GUI, Spotify login, and visual Spicetify testing remain outstanding. The manager reports package-specific limits rather than treating those environments as already proven.
 
-CI also rebuilds and runs all Windows tests on a Windows runner. It enforces the recorded Windows release SHA-256 and CRLF line endings so Linux generation cannot change the Windows release bytes.
+The remaining real-machine checks and release approval gates are recorded in the [manual validation checklist](MANUAL-VALIDATION.md). They remain pending until the maintainer reports the results.
+
+CI also rebuilds and runs all Windows tests on a Windows runner. It enforces the Windows EXE SHA-256 recorded in `build/windows-release.sha256`, embedded-source parity, native argument boundaries and version agreement. The EXE is binary and has no text line-ending requirement; the Linux release remains LF and executable. Update the Windows hash record only after validating an intentional source change, not automatically during a build. The tests compare consecutive builds and a clean build from a different directory, including a Unicode path.
 
 ## Research references
 

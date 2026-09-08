@@ -3,7 +3,12 @@
 ssm_main() {
     local action="menu"
     local result
+    local action_seen=0
     while (($#)); do
+        case "$1" in --help|-h|--version|-V|--status)
+            (( action_seen == 0 )) || { ssm_error "Choose only one command-line action."; return 64; }
+            action_seen=1 ;;
+        esac
         case "$1" in
             --help|-h) action="help"; shift ;;
             --version|-V) action="version"; shift ;;
@@ -22,6 +27,7 @@ ssm_main() {
             *) ssm_error "Unknown option: $1"; ssm_print_help >&2; return 64 ;;
         esac
     done
+    (( $# == 0 )) || { ssm_error "Unexpected positional arguments."; return 64; }
     case "$action" in
         help) ssm_print_help ;;
         version) printf '%s %s\n' "$SSM_NAME" "$SSM_VERSION" ;;
@@ -36,6 +42,9 @@ ssm_main() {
             ssm_require_non_root
             result=$?
             (( result == 0 )) || return "$result"
+            trap 'ssm_signal_handler SIGINT 130' INT
+            trap 'ssm_signal_handler SIGTERM 143' TERM
+            trap 'ssm_signal_handler SIGHUP 129' HUP
             ssm_detect_context
             ssm_show_menu
             ;;

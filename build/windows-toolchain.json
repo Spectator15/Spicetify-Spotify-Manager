@@ -1,0 +1,5 @@
+[
+  { "id": "microsoft.net.compilers.toolset", "version": "4.14.0", "sha256": "941a9cf3ea618d88d01a3dd6b1a45a06bcf07716a9f81ce4031caa3edd24a845" },
+  { "id": "microsoft.netframework.referenceassemblies.net48", "version": "1.0.3", "sha256": "8a7e348538e7eb91351696911689f49e3d4f63f8bab517432bbe159b8b1104a2" },
+  { "id": "microsoft.powershell.5.referenceassemblies", "version": "1.1.0", "sha256": "2bc5ab45f20bfa5d9d141611cf8b68c23a8d94371f01bcea65e5f71a86deea45" }
+]

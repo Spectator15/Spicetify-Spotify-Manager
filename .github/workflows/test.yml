@@ -29,16 +29,20 @@ jobs:
 
       - name: Confirm the build made no changes
         shell: powershell
-        run: git diff --exit-code -- Spicetify-Spotify-Manager.bat
+        run: git diff --exit-code -- Spicetify-Spotify-Manager.exe
 
-      - name: Protect Windows release bytes and line endings
+      - name: Protect Windows release bytes and version agreement
         shell: powershell
         run: |
-          $expected = '65C8546BFFF555A52599FD6D155358E8B14CAEDF6DC609AA7D704E0253D19599'
-          $actual = (Get-FileHash -LiteralPath .\Spicetify-Spotify-Manager.bat -Algorithm SHA256).Hash
+          $record = [IO.File]::ReadAllText((Resolve-Path .\build\windows-release.sha256)).TrimEnd("`r", "`n")
+          if ($record -cnotmatch '^([a-f0-9]{64})  Spicetify-Spotify-Manager\.exe$') { throw 'Invalid Windows hash record.' }
+          $expected = $Matches[1]
+          $actual = (Get-FileHash -LiteralPath .\Spicetify-Spotify-Manager.exe -Algorithm SHA256).Hash
           if ($actual -ne $expected) { throw "Windows release SHA-256 changed: $actual" }
-          $text = [IO.File]::ReadAllText((Resolve-Path .\Spicetify-Spotify-Manager.bat))
-          if ($text -match '(?<!\r)\n') { throw 'Windows release contains a bare LF.' }
+          $version = [IO.File]::ReadAllText((Resolve-Path .\VERSION)).Trim()
+          $reported = & .\Spicetify-Spotify-Manager.exe --version
+          if ($LASTEXITCODE -ne 0 -or $reported -cne "Spicetify Spotify Manager $version") { throw 'EXE version mismatch.' }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$version") { throw 'Tag version mismatch.' }
 
   linux-tests:
     runs-on: ubuntu-latest
@@ -63,10 +67,10 @@ jobs:
 
       - name: Protect generated files and platform line endings
         run: |
-          git diff --exit-code -- Spicetify-Spotify-Manager-Linux.sh Spicetify-Spotify-Manager.bat
+          git diff --exit-code -- Spicetify-Spotify-Manager-Linux.sh Spicetify-Spotify-Manager.exe
           test -x Spicetify-Spotify-Manager-Linux.sh
           ! LC_ALL=C grep -q $'\r' Spicetify-Spotify-Manager-Linux.sh
-          test "$(sha256sum Spicetify-Spotify-Manager.bat | cut -d' ' -f1)" = "65c8546bfff555a52599fd6d155358e8b14caedf6dc609aa7d704e0253d19599"
+          sha256sum --check build/windows-release.sha256
 
   release:
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
@@ -92,15 +96,19 @@ jobs:
           fi
           [[ "$(git cat-file -t "$GITHUB_REF_NAME")" == tag ]] || fail "$GITHUB_REF_NAME is not an annotated tag."
           [[ "$(git rev-parse "$GITHUB_REF_NAME^{}")" == "$GITHUB_SHA" ]] || fail "$GITHUB_REF_NAME does not point to the workflow commit."
-          [[ -f Spicetify-Spotify-Manager.bat ]] || fail "The Windows release file is missing."
+          [[ -f Spicetify-Spotify-Manager.exe ]] || fail "The Windows release file is missing."
+          [[ "$(head -c 2 Spicetify-Spotify-Manager.exe)" == MZ ]] || fail "The Windows release is not a PE executable."
+          sha256sum --check build/windows-release.sha256
           [[ -x Spicetify-Spotify-Manager-Linux.sh ]] || fail "The Linux release file is missing or is not executable."
           tag_version=${GITHUB_REF_NAME#v}
-          windows_version=$(awk -F"'" '/^\$script:ManagerVersion = / { print $2; exit }' Spicetify-Spotify-Manager.bat)
+          project_version=$(< VERSION)
           linux_version=$(./Spicetify-Spotify-Manager-Linux.sh --version | awk '{print $NF}')
-          [[ "$windows_version" == "$tag_version" ]] || fail "Windows version $windows_version does not match tag $tag_version."
+          [[ "$project_version" == "$tag_version" ]] || fail "Project version $project_version does not match tag $tag_version."
+          # The required Windows job executes the EXE and verifies its version
+          # against VERSION and this exact tag. Ubuntu verifies those same bytes.
           [[ "$linux_version" == "$tag_version" ]] || fail "Linux version $linux_version does not match tag $tag_version."
           ./build/build-linux-release.sh --check
-          sha256sum Spicetify-Spotify-Manager.bat Spicetify-Spotify-Manager-Linux.sh > SHA256SUMS
+          sha256sum Spicetify-Spotify-Manager.exe Spicetify-Spotify-Manager-Linux.sh > SHA256SUMS
           sha256sum --check SHA256SUMS
 
       - name: Create stable GitHub Release
@@ -117,7 +125,7 @@ jobs:
           Windows and Ubuntu validation completed before publication. Linux support remains package-specific, and real graphical CachyOS, Flatpak Spotify, and visual Spicetify runtime testing may still be outstanding as documented in the README.
           EOF
           gh release create "$GITHUB_REF_NAME" \
-            Spicetify-Spotify-Manager.bat \
+            Spicetify-Spotify-Manager.exe \
             Spicetify-Spotify-Manager-Linux.sh \
             SHA256SUMS \
             --draft \
@@ -125,7 +133,7 @@ jobs:
             --notes-file RELEASE_NOTES.md \
             --verify-tag
           assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
-          for expected in Spicetify-Spotify-Manager.bat Spicetify-Spotify-Manager-Linux.sh SHA256SUMS; do
+          for expected in Spicetify-Spotify-Manager.exe Spicetify-Spotify-Manager-Linux.sh SHA256SUMS; do
             grep -Fqx "$expected" <<< "$assets" || {
               echo "::error::Release asset is missing after upload: $expected"
               exit 1

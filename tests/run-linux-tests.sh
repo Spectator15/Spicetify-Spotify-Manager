@@ -8,7 +8,6 @@ readonly test_dir
 repo=$(cd -- "$test_dir/.." && pwd -P)
 readonly repo
 readonly release="$repo/Spicetify-Spotify-Manager-Linux.sh"
-readonly expected_windows_sha="65c8546bfff555a52599fd6d155358e8b14caedf6dc609aa7d704e0253d19599"
 
 passed=0
 failed=0
@@ -178,10 +177,10 @@ test_lf() { ! LC_ALL=C grep -q $'\r' "$release"; }
 test_executable() { [[ -x "$release" ]]; }
 test_marker() { [[ "$(grep -Fxc '# <SPICETIFY_MANAGER_LINUX_MAIN>' "$release")" == 1 ]]; }
 test_no_local_paths() { ! grep -Eq 'C:\\Users\\|/home/runner/' "$release"; }
-test_windows_hash() { assert_eq "$(sha256sum "$repo/Spicetify-Spotify-Manager.bat" | cut -d' ' -f1)" "$expected_windows_sha"; }
+test_windows_hash() { (cd "$repo" && sha256sum --check build/windows-release.sha256); }
 test_deterministic() { "$repo/build/build-linux-release.sh" --check >/dev/null; local a b; a=$(sha256sum "$release"); "$repo/build/build-linux-release.sh" >/dev/null; b=$(sha256sum "$release"); assert_eq "$a" "$b"; }
 test_help() { assert_contains "$("$release" --help)" '--status'; }
-test_version() { assert_eq "$("$release" --version)" 'Spicetify Spotify Manager 1.1.0'; }
+test_version() { assert_eq "$("$release" --version)" 'Spicetify Spotify Manager 1.2.0'; }
 test_unknown_option() { "$release" --not-real >/dev/null 2>&1; [[ $? == 64 ]]; }
 
 test_root_refusal() { setup_case; # shellcheck disable=SC2329
@@ -190,6 +189,12 @@ test_state_atomic() { setup_case; ssm_write_state_atomic control 'schema=1' 'kin
 test_state_corruption() { setup_case; mkdir -p "$(ssm_state_directory)"; chmod 700 "$(ssm_state_directory)"; printf 'bad\n' > "$(ssm_state_path control)"; chmod 600 "$(ssm_state_path control)"; ssm_read_state control >/dev/null 2>&1; [[ $? == 78 ]]; }
 test_unsafe_state_mode() { setup_case; mkdir -p "$(ssm_state_directory)"; chmod 700 "$(ssm_state_directory)"; printf 'schema\t1\n' > "$(ssm_state_path control)"; chmod 666 "$(ssm_state_path control)"; ssm_read_state control >/dev/null 2>&1; [[ $? == 78 ]]; }
 test_symlink_state() { setup_case; mkdir -p "$(ssm_state_directory)"; chmod 700 "$(ssm_state_directory)"; touch "$CASE_ROOT/outside"; ln -s "$CASE_ROOT/outside" "$(ssm_state_path control)"; ssm_read_state control >/dev/null 2>&1; [[ $? == 78 ]]; }
+test_log_private() { setup_case; ssm_info 'operation started' >/dev/null; ssm_warn 'recovery warning' >/dev/null 2>&1; ssm_error 'operation failed' >/dev/null 2>&1; local log; log=$(ssm_log_path); assert_file "$log"; assert_eq "$(stat -c %a "$log")" 600; assert_eq "$(stat -c %a "$(ssm_state_directory)")" 700; assert_contains "$(cat "$log")" '[INFO] operation started'; assert_contains "$(cat "$log")" '[WARN] recovery warning'; assert_contains "$(cat "$log")" '[ERROR] operation failed'; grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z \[(INFO|WARN|ERROR)\]' "$log"; }
+test_log_symlink_refusal() { setup_case; local directory outside output; directory=$(ssm_assert_safe_state_directory); outside="$CASE_ROOT/outside.log"; printf 'preserve\n' > "$outside"; chmod 600 "$outside"; ln -s "$outside" "$directory/manager.log"; output=$(ssm_error 'original operational error' 2>&1); assert_contains "$output" 'original operational error'; assert_contains "$output" 'could not write its private log'; assert_eq "$(cat "$outside")" preserve; [[ -L "$directory/manager.log" ]]; }
+test_log_unsafe_mode_refusal() { setup_case; local directory log before output; directory=$(ssm_assert_safe_state_directory); log="$directory/manager.log"; printf 'preserve\n' > "$log"; chmod 666 "$log"; before=$(cat "$log"); output=$(ssm_warn 'important warning' 2>&1); assert_contains "$output" 'important warning'; assert_contains "$output" 'could not write its private log'; assert_eq "$(cat "$log")" "$before"; }
+test_log_rotation() { setup_case; local directory log; directory=$(ssm_assert_safe_state_directory); log="$directory/manager.log"; truncate -s "$SSM_LOG_MAX_BYTES" "$log"; chmod 600 "$log"; ssm_info 'after rotation' >/dev/null; assert_file "$log"; assert_file "$log.1"; assert_eq "$(stat -c %a "$log")" 600; assert_eq "$(stat -c %a "$log.1")" 600; assert_contains "$(cat "$log")" 'after rotation'; [[ "$(stat -c %s "$log")" -lt "$SSM_LOG_MAX_BYTES" ]]; }
+test_log_custom_xdg_unicode() { setup_case; export XDG_STATE_HOME="$CASE_ROOT/Private State ü"; ssm_success 'unicode path works' >/dev/null; local log; log=$(ssm_log_path); assert_file "$log"; assert_contains "$(cat "$log")" 'unicode path works'; assert_eq "$(stat -c %a "$log")" 600; }
+test_log_readonly_failure_isolated() { setup_case; local readonly_root output; readonly_root="$CASE_ROOT/read-only"; mkdir -p "$readonly_root"; chmod 500 "$readonly_root"; export XDG_STATE_HOME="$readonly_root/state"; output=$(ssm_error 'primary failure remains visible' 2>&1); assert_contains "$output" 'primary failure remains visible'; assert_contains "$output" 'could not write its private log'; [[ ! -e "$XDG_STATE_HOME/spicetify-spotify-manager/manager.log" ]]; chmod 700 "$readonly_root"; }
 
 setup_flatpak() {
     setup_case
@@ -251,10 +256,217 @@ test_spicetify_stale() { setup_flatpak; export SSM_FAKE_SPOTIFY_PATH=$SSM_SPOTIF
 
 test_guided_flatpak_success() { setup_flatpak; export SSM_FAKE_SPOTIFY_PATH=$SSM_SPOTIFY_PATH; ssm_block_updates >/dev/null; ssm_guided_update >/dev/null; assert_eq "$(ssm_update_state)" blocked-manager; assert_file "$SSM_FAKE_STATE/flatpak-update"; assert_no_file "$(ssm_state_path workflow)"; }
 test_guided_failure_rollback() { setup_flatpak; export SSM_FAKE_SPOTIFY_PATH=$SSM_SPOTIFY_PATH SSM_FAKE_UPDATE_FAIL=1; ssm_block_updates >/dev/null; if ssm_guided_update >/dev/null 2>&1; then return 1; fi; assert_eq "$(ssm_update_state)" blocked-manager; assert_no_file "$(ssm_state_path workflow)"; }
-test_recovery_state() { setup_flatpak; ssm_save_workflow interrupted allowed 0 flatpak; ssm_recovery_present; ssm_recover_workflow >/dev/null; assert_no_file "$(ssm_state_path workflow)"; }
+test_recovery_state() { setup_flatpak; ssm_save_workflow updating allowed 0 flatpak; ssm_recovery_present; ssm_recover_workflow >/dev/null; assert_no_file "$(ssm_state_path workflow)"; }
 test_control_only_recovery() { setup_flatpak; ssm_write_state_atomic control 'schema=1' 'kind=flatpak' 'scope=user' 'owner=manager' 'target=com.spotify.Client' 'phase=applying'; assert_eq "$(ssm_update_state)" recovery-required; ssm_recover_workflow >/dev/null; assert_eq "$(ssm_update_state)" allowed; assert_no_file "$(ssm_state_path control)"; }
 test_permission_restore() { setup_apt; local unrelated="$CASE_ROOT/unrelated"; printf 'keep\n' > "$unrelated"; chmod 640 "$unrelated"; ln -s "$unrelated" "$SSM_SPOTIFY_PATH/Apps/unrelated-link"; chmod 555 "$SSM_SPOTIFY_PATH" "$SSM_SPOTIFY_PATH/Apps"; chmod 444 "$SSM_SPOTIFY_PATH/Apps/xpui.spa"; local root_before apps_before file_before unrelated_before; root_before=$(stat -c %a "$SSM_SPOTIFY_PATH"); apps_before=$(stat -c %a "$SSM_SPOTIFY_PATH/Apps"); file_before=$(stat -c %a "$SSM_SPOTIFY_PATH/Apps/xpui.spa"); unrelated_before=$(stat -c %a "$unrelated"); # shellcheck disable=SC2329
-    ssm_confirm(){ return 0; }; ssm_prepare_write_access; assert_file "$(ssm_state_path permissions)"; [[ -w "$SSM_SPOTIFY_PATH/Apps/xpui.spa" ]]; ssm_restore_write_access; assert_eq "$(stat -c %a "$SSM_SPOTIFY_PATH")" "$root_before"; assert_eq "$(stat -c %a "$SSM_SPOTIFY_PATH/Apps")" "$apps_before"; assert_eq "$(stat -c %a "$SSM_SPOTIFY_PATH/Apps/xpui.spa")" "$file_before"; assert_eq "$(stat -c %a "$unrelated")" "$unrelated_before"; assert_eq "$(cat "$unrelated")" keep; assert_no_file "$(ssm_state_path permissions)"; }
+    ssm_confirm(){ return 0; }; ssm_prepare_write_access >/dev/null 2>&1; assert_eq "$?" 78; assert_no_file "$(ssm_state_path permissions)"; chmod u+w "$SSM_SPOTIFY_PATH/Apps"; rm "$SSM_SPOTIFY_PATH/Apps/unrelated-link"; chmod "$apps_before" "$SSM_SPOTIFY_PATH/Apps"; ssm_prepare_write_access; assert_file "$(ssm_state_path permissions)"; [[ -w "$SSM_SPOTIFY_PATH/Apps/xpui.spa" ]]; ssm_restore_write_access; assert_eq "$(stat -c %a "$SSM_SPOTIFY_PATH")" "$root_before"; assert_eq "$(stat -c %a "$SSM_SPOTIFY_PATH/Apps")" "$apps_before"; assert_eq "$(stat -c %a "$SSM_SPOTIFY_PATH/Apps/xpui.spa")" "$file_before"; assert_eq "$(stat -c %a "$unrelated")" "$unrelated_before"; assert_eq "$(cat "$unrelated")" keep; assert_no_file "$(ssm_state_path permissions)"; }
+
+test_conflicting_cli() {
+    "$release" --help --status >/dev/null 2>&1; assert_eq "$?" 64
+    "$release" -- unexpected >/dev/null 2>&1; assert_eq "$?" 64
+    "$repo/build/build-linux-release.sh" --typo >/dev/null 2>&1; assert_eq "$?" 64
+}
+test_incomplete_and_duplicate_state() {
+    setup_flatpak
+    ssm_write_state_atomic control 'schema=1' 'kind=flatpak'
+    ssm_update_state >/dev/null 2>&1; assert_eq "$?" 78
+    ssm_block_updates >/dev/null 2>&1; assert_eq "$?" 78
+    assert_no_file "$SSM_FAKE_STATE/mask-user"
+    ssm_write_state_atomic control 'schema=1' 'kind=flatpak' 'scope=user' 'owner=manager' 'target=com.spotify.Client' 'phase=blocked' 'phase=applying'
+    ssm_read_state control >/dev/null 2>&1; assert_eq "$?" 78
+}
+test_state_directory_read_safety() {
+    setup_flatpak
+    ssm_block_updates >/dev/null
+    local directory outside
+    directory=$(ssm_state_directory); outside="$CASE_ROOT/outside-state"
+    mv "$directory" "$outside"; ln -s "$outside" "$directory"
+    ssm_read_state control >/dev/null 2>&1; assert_eq "$?" 78
+    rm "$directory"; mv "$outside" "$directory"; chmod 777 "$directory"
+    ssm_read_state control >/dev/null 2>&1; assert_eq "$?" 78
+    chmod 700 "$directory"
+}
+test_dangling_state_refused() {
+    setup_case
+    local directory
+    directory=$(ssm_assert_safe_state_directory)
+    ln -s "$CASE_ROOT/missing" "$directory/control.state"
+    ssm_read_state control >/dev/null 2>&1; assert_eq "$?" 78
+    ssm_write_state_atomic control 'schema=1' >/dev/null 2>&1; assert_eq "$?" 78
+    [[ -L "$directory/control.state" ]]
+}
+test_applying_mask_requires_recovery() {
+    setup_flatpak
+    ssm_write_state_atomic control 'schema=1' 'kind=flatpak' 'scope=user' 'owner=manager' 'target=com.spotify.Client' 'phase=applying'
+    printf 'com.spotify.Client\n' > "$SSM_FAKE_STATE/mask-user"
+    assert_eq "$(ssm_update_state)" recovery-required
+    ssm_recover_workflow >/dev/null
+    assert_eq "$(ssm_update_state)" allowed
+}
+test_unmask_verification_failure() {
+    setup_flatpak
+    export SSM_FAKE_QUERY_FAIL=1
+    ssm_set_control_raw 0 >/dev/null 2>&1; assert_eq "$?" 70
+    SSM_KIND=apt; SSM_SCOPE=system
+    ssm_set_control_raw 0 >/dev/null 2>&1; assert_eq "$?" 70
+}
+test_unmask_failure_retains_ownership() {
+    setup_flatpak
+    ssm_block_updates >/dev/null || return
+    # Query succeeds before removal, then fails after the real fake command runs.
+    ssm_flatpak_masked(){ [[ -f "$SSM_FAKE_STATE/mask-user" ]] && return 0; return 70; }
+    ssm_allow_updates >/dev/null 2>&1; assert_eq "$?" 70
+    assert_no_file "$SSM_FAKE_STATE/mask-user"
+    assert_file "$(ssm_state_path control)"
+    ssm_read_state control || return
+    assert_eq "$SSM_STATE_OWNER:$SSM_STATE_PHASE" 'manager:blocked'
+}
+test_unhold_failure_retains_ownership() {
+    setup_apt
+    ssm_block_updates >/dev/null || return
+    ssm_apt_held(){ [[ -f "$SSM_FAKE_STATE/apt-hold" ]] && return 0; return 70; }
+    ssm_allow_updates >/dev/null 2>&1; assert_eq "$?" 70
+    assert_no_file "$SSM_FAKE_STATE/apt-hold"
+    assert_file "$(ssm_state_path control)"
+    ssm_read_state control || return
+    assert_eq "$SSM_STATE_OWNER:$SSM_STATE_PHASE" 'manager:blocked'
+}
+test_flatpak_relaunch_scope() {
+    setup_flatpak
+    ssm_start_spotify || return
+    assert_eq "$(cat "$SSM_FAKE_STATE/flatpak-run")" '--user com.spotify.Client'
+    SSM_SCOPE=system
+    rm -f "$SSM_FAKE_STATE/running"
+    ssm_start_spotify || return
+    assert_eq "$(cat "$SSM_FAKE_STATE/flatpak-run")" '--system com.spotify.Client'
+}
+test_apps_symlink_refused() {
+    setup_apt
+    local outside="$CASE_ROOT/outside-apps"
+    mv "$SSM_SPOTIFY_PATH/Apps" "$outside"
+    ln -s "$outside" "$SSM_SPOTIFY_PATH/Apps"
+    ssm_prepare_write_access >/dev/null 2>&1; assert_eq "$?" 78
+    assert_no_file "$(ssm_state_path permissions)"
+    assert_eq "$(cat "$outside/xpui.spa")" stock
+}
+test_permission_manifest_headers() {
+    setup_apt
+    ssm_write_state_atomic permissions 'schema=1'
+    local calls=0
+    ssm_run_privileged(){ ((calls+=1)); return 0; }
+    ssm_restore_write_access >/dev/null 2>&1; assert_eq "$?" 78
+    assert_eq "$calls" 0
+    assert_file "$(ssm_state_path permissions)"
+}
+test_permission_new_file_preserved() {
+    setup_apt
+    chmod 555 "$SSM_SPOTIFY_PATH" "$SSM_SPOTIFY_PATH/Apps"
+    ssm_confirm(){ return 0; }
+    ssm_prepare_write_access || return
+    printf 'external\n' > "$SSM_SPOTIFY_PATH/Apps/new-file"
+    chmod 660 "$SSM_SPOTIFY_PATH/Apps/new-file"
+    ssm_restore_write_access || return
+    assert_eq "$(stat -c %a "$SSM_SPOTIFY_PATH/Apps/new-file")" 660
+}
+test_permission_recovery_missing_xpui() {
+    setup_apt
+    chmod 555 "$SSM_SPOTIFY_PATH" "$SSM_SPOTIFY_PATH/Apps"
+    chmod 444 "$SSM_SPOTIFY_PATH/Apps/xpui.spa"
+    ssm_confirm(){ return 0; }
+    ssm_prepare_write_access || return
+    rm "$SSM_SPOTIFY_PATH/Apps/xpui.spa"
+    local original_path=$SSM_SPOTIFY_PATH
+    ssm_detect_context
+    assert_eq "$SSM_SUPPORT" unsupported
+    assert_eq "$SSM_SPOTIFY_PATH" "$original_path"
+    ssm_recover_workflow >/dev/null || return
+    assert_eq "$(stat -c %a "$SSM_SPOTIFY_PATH")" 555
+    assert_eq "$(stat -c %a "$SSM_SPOTIFY_PATH/Apps")" 555
+    assert_no_file "$(ssm_state_path permissions)"
+}
+test_guided_decline_does_nothing() {
+    setup_flatpak
+    printf '4242\n' > "$SSM_FAKE_STATE/running"
+    ssm_confirm(){ return 1; }
+    ssm_guided_update >/dev/null 2>&1; assert_eq "$?" 64
+    assert_file "$SSM_FAKE_STATE/running"
+    assert_no_file "$SSM_FAKE_STATE/flatpak-update"
+    assert_no_file "$(ssm_state_path workflow)"
+}
+test_failed_stage_write_prevents_update() {
+    setup_flatpak
+    ssm_save_workflow(){ [[ "$1" != updating ]]; }
+    ssm_guided_update >/dev/null 2>&1
+    assert_no_file "$SSM_FAKE_STATE/flatpak-update"
+}
+test_root_refusal_no_log() {
+    setup_case
+    ssm_current_uid(){ printf '0\n'; }
+    ssm_require_non_root >/dev/null 2>&1; assert_eq "$?" 77
+    assert_no_file "$(ssm_state_directory)"
+}
+test_status_queries_control_once() {
+    setup_flatpak
+    ssm_flatpak_masked(){ printf 'query\n' >> "$CASE_ROOT/query-count"; return 1; }
+    ssm_show_status >/dev/null
+    assert_eq "$(wc -l < "$CASE_ROOT/query-count")" 1
+}
+test_repair_signal_restores_permissions() {
+    setup_apt
+    chmod 555 "$SSM_SPOTIFY_PATH" "$SSM_SPOTIFY_PATH/Apps"
+    ssm_confirm(){ return 0; }
+    ssm_prepare_write_access || return
+    local result
+    ( trap 'ssm_signal_handler SIGHUP 129' HUP; kill -HUP "$BASHPID"; exit 99 ) >/dev/null 2>&1
+    result=$?
+    assert_eq "$result" 129
+    assert_eq "$(stat -c %a "$SSM_SPOTIFY_PATH")" 555
+    assert_no_file "$(ssm_state_path permissions)"
+}
+test_flatpak_deployment_recovery() {
+    setup_flatpak
+    ssm_save_workflow updating allowed 0 flatpak
+    local updated="$CASE_ROOT/new-deployment"
+    make_spotify_tree "$updated"
+    SSM_SPOTIFY_PATH=$updated
+    ssm_recover_workflow >/dev/null || return
+    assert_no_file "$(ssm_state_path workflow)"
+    assert_eq "$(ssm_update_state)" allowed
+}
+test_external_mask_pattern() {
+    setup_flatpak
+    printf 'com.spotify.*\n' > "$SSM_FAKE_STATE/mask-user"
+    ssm_block_updates >/dev/null 2>&1; assert_eq "$?" 70
+    ssm_allow_updates >/dev/null 2>&1; assert_eq "$?" 70
+    assert_eq "$(cat "$SSM_FAKE_STATE/mask-user")" 'com.spotify.*'
+    assert_no_file "$(ssm_state_path control)"
+}
+test_linux_installer_validation() {
+    setup_case
+    local fixture="$CASE_ROOT/installer.sh"
+    cat > "$fixture" <<'INSTALLER'
+#!/usr/bin/env sh
+# Synthetic installer-shaped data, never executed.
+is_root() { :; }
+notfound() { :; }
+endswith_newline() { :; }
+check() { :; }
+releases_uri=https://github.com/spicetify/cli/releases
+download_uri=$releases_uri/download/v$tag/spicetify-$tag-$target.tar.gz
+INSTALLER
+    printf '# %1200s\n' '' >> "$fixture"
+    ssm_validate_installer "$fixture" || return
+    printf '\nif\n' >> "$fixture"
+    if ssm_validate_installer "$fixture"; then return 1; fi
+    printf '#!/usr/bin/env sh\n# github.com/spicetify/cli/releases\n' > "$fixture"
+    if ssm_validate_installer "$fixture"; then return 1; fi
+    printf '<html>%1200s</html>\n' '' > "$fixture"
+    if ssm_validate_installer "$fixture"; then return 1; fi
+    printf '{"error":"%1200s"}\n' '' > "$fixture"
+    if ssm_validate_installer "$fixture"; then return 1; fi
+    printf '#!/usr/bin/env sh\n# %1200s\necho unrelated\n' '' > "$fixture"
+    ! ssm_validate_installer "$fixture"
+}
 test_permission_failure_recovery() { setup_apt; chmod 555 "$SSM_SPOTIFY_PATH" "$SSM_SPOTIFY_PATH/Apps"; chmod 444 "$SSM_SPOTIFY_PATH/Apps/xpui.spa"; local calls=0; # shellcheck disable=SC2329
     ssm_confirm(){ return 0; }; # shellcheck disable=SC2329
     ssm_run_privileged(){ ((calls+=1)); (( calls != 2 )) || return 1; "$@"; }
@@ -268,6 +480,8 @@ test_sigint_cleanup() { setup_case; local temp code; temp=$(mktemp -d /tmp/spice
     SSM_TEMP_DIR=$temp; trap 'ssm_signal_handler SIGINT 130' INT; kill -INT "$BASHPID"; exit 99) >/dev/null 2>&1; code=$?; assert_eq "$code" 130; assert_no_file "$temp"; }
 test_sighup_cleanup() { setup_case; local temp code; temp=$(mktemp -d /tmp/spicetify-manager-signal.XXXXXX); ( # shellcheck disable=SC2034
     SSM_TEMP_DIR=$temp; trap 'ssm_signal_handler SIGHUP 129' HUP; kill -HUP "$BASHPID"; exit 99) >/dev/null 2>&1; code=$?; assert_eq "$code" 129; assert_no_file "$temp"; }
+test_signal_log_valid() { setup_case; local temp code log; temp=$(mktemp -d /tmp/spicetify-manager-signal.XXXXXX); ( # shellcheck disable=SC2034
+    SSM_TEMP_DIR=$temp; trap 'ssm_signal_handler SIGINT 130' INT; kill -INT "$BASHPID"; exit 99) >/dev/null 2>&1; code=$?; assert_eq "$code" 130; log=$(ssm_log_path); assert_file "$log"; assert_eq "$(stat -c %a "$log")" 600; assert_contains "$(cat "$log")" 'Received SIGINT'; }
 test_sigterm_rollback() { setup_flatpak; local code; printf 'com.spotify.Client\n' > "$SSM_FAKE_STATE/mask-user"; ssm_save_workflow updating allowed 0 flatpak; ( # shellcheck disable=SC2034
     SSM_WORKFLOW_ACTIVE=1; trap 'ssm_signal_handler SIGTERM 143' TERM; kill -TERM "$BASHPID"; exit 99) >/dev/null 2>&1; code=$?; assert_eq "$code" 143; assert_no_file "$SSM_FAKE_STATE/mask-user"; assert_no_file "$(ssm_state_path workflow)"; }
 
@@ -297,6 +511,12 @@ run_test 'state writes are atomic and private' test_state_atomic
 run_test 'corrupt state is rejected' test_state_corruption
 run_test 'unsafe state permissions are rejected' test_unsafe_state_mode
 run_test 'symlink state files are rejected' test_symlink_state
+run_test 'Linux logging uses private timestamped levels' test_log_private
+run_test 'symlinked Linux logs are refused without hiding errors' test_log_symlink_refusal
+run_test 'unsafe Linux log permissions are refused' test_log_unsafe_mode_refusal
+run_test 'Linux logs rotate at the bounded size' test_log_rotation
+run_test 'Linux logging supports custom XDG paths with spaces and Unicode' test_log_custom_xdg_unicode
+run_test 'Linux logging failures do not hide operational errors' test_log_readonly_failure_isolated
 run_test 'Flatpak user install is detected' test_flatpak_user
 run_test 'Flatpak system install is detected' test_flatpak_system
 run_test 'dual-scope Flatpak is ambiguous' test_flatpak_ambiguous
@@ -343,7 +563,29 @@ run_test 'permission-command failure remains recoverable' test_permission_failur
 run_test 'permission restoration requires verified final modes' test_permission_restore_verification
 run_test 'SIGINT uses code 130 and cleans temporary files' test_sigint_cleanup
 run_test 'SIGHUP uses code 129 and cleans temporary files' test_sighup_cleanup
+run_test 'signal handling leaves a valid private log' test_signal_log_valid
 run_test 'SIGTERM uses code 143 and rolls back workflow state' test_sigterm_rollback
+run_test 'conflicting CLI actions and unknown builder arguments are refused' test_conflicting_cli
+run_test 'incomplete and duplicate state cannot authorize changes' test_incomplete_and_duplicate_state
+run_test 'state reads reject symlinked and unsafe directories' test_state_directory_read_safety
+run_test 'dangling state links cannot be read or overwritten' test_dangling_state_refused
+run_test 'an applying mask remains recovery-required' test_applying_mask_requires_recovery
+run_test 'unmask and unhold verification failures are not successful restoration' test_unmask_verification_failure
+run_test 'a failed post-unmask query retains manager ownership for recovery' test_unmask_failure_retains_ownership
+run_test 'a failed post-unhold query retains manager ownership for recovery' test_unhold_failure_retains_ownership
+run_test 'Flatpak relaunch uses the detected user or system scope' test_flatpak_relaunch_scope
+run_test 'an Apps directory symlink is refused before permission operations' test_apps_symlink_refused
+run_test 'incomplete permission manifests cannot authorize chmod' test_permission_manifest_headers
+run_test 'permission recovery preserves externally-created file modes' test_permission_new_file_preserved
+run_test 'permission recovery works after a failed repair removes xpui' test_permission_recovery_missing_xpui
+run_test 'declining a guided update never stops Spotify' test_guided_decline_does_nothing
+run_test 'a failed stage write prevents package update execution' test_failed_stage_write_prevents_update
+run_test 'root refusal never creates state or logs' test_root_refusal_no_log
+run_test 'status performs only one package control query' test_status_queries_control_once
+run_test 'ordinary repair signal handling restores temporary permissions' test_repair_signal_restores_permissions
+run_test 'Flatpak recovery accepts a rediscovered deployment in the same scope' test_flatpak_deployment_recovery
+run_test 'broader external Flatpak masks are preserved and automatic control is refused' test_external_mask_pattern
+run_test 'Linux installer validation rejects malformed and unrelated content' test_linux_installer_validation
 
 printf '\nLinux tests: %d passed, %d failed\n' "$passed" "$failed"
 (( failed == 0 ))

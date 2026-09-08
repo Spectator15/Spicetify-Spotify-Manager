@@ -1,18 +1,24 @@
 [CmdletBinding()]
 param(
     [switch]$NoMain,
-    [ValidateSet('', 'Block', 'Allow', 'AllowForce')]
-    [string]$ElevatedAclAction = '',
-    [string]$ElevatedResultPath = ''
+    [ValidateSet('', 'Menu', 'Help', 'Version', 'Status', 'Invalid')]
+    [string]$CliAction = '',
+    [AllowEmptyCollection()][AllowEmptyString()]
+    [string[]]$NativeArguments = @()
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
 $script:ManagerName = 'Spicetify Spotify Manager'
-$script:ManagerVersion = '1.0.0'
+$script:ManagerVersion = '__SPICETIFY_MANAGER_VERSION__'
 $script:OfficialInstallerUrl = 'https://raw.githubusercontent.com/spicetify/cli/main/install.ps1'
+$script:ElevatedAclHelperTemplateBase64 = '__SPICETIFY_MANAGER_ELEVATED_HELPER_BASE64__'
+$script:DirectoryAclSourceBase64 = '__SPICETIFY_MANAGER_DIRECTORY_ACL_BASE64__'
 $script:TestHooks = @{}
+$script:PermitAclElevation = $false
+$script:AclElevationAction = ''
+$script:ReadOnlyMode = $false
 
 function Set-ManagerTestHooks {
     [CmdletBinding()]
@@ -60,14 +66,34 @@ function Get-ManagerDataDirectory {
 
 function Initialize-ManagerDataDirectory {
     $directory = Get-ManagerDataDirectory
+    Assert-SafeManagerDataDirectory
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
+    Assert-SafeManagerDataDirectory
     return $directory
+}
+
+function Assert-SafeManagerDataDirectory {
+    $directory = Get-ManagerDataDirectory
+    Assert-NoReparsePath $directory
+    if (-not (Test-Path -LiteralPath $directory)) { return }
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { throw 'Manager state path is not a directory.' }
+    $acl = Get-Acl -LiteralPath $directory
+    $sid = Get-CurrentUserSid
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid) { throw 'Manager state directory has an unexpected owner.' }
+    $writeRights = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -eq 'Allow' -and ($rule.FileSystemRights -band $writeRights) -ne 0 -and
+            $rule.IdentityReference.Value -notin @($sid, 'S-1-5-18', 'S-1-5-32-544', 'S-1-3-0')) {
+            throw 'Manager state directory grants write access to an unexpected account.'
+        }
+    }
 }
 
 function Get-ManagerStatePath {
     param([ValidateSet('Update', 'Guided')][string]$Kind)
+    Assert-SafeManagerDataDirectory
     $fileName = if ($Kind -eq 'Update') { 'update-state.json' } else { 'guided-state.json' }
     return Join-Path (Get-ManagerDataDirectory) $fileName
 }
@@ -77,8 +103,10 @@ function Write-ManagerLog {
         [Parameter(Mandatory = $true)][string]$Message,
         [ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level = 'INFO'
     )
+    if ($script:ReadOnlyMode) { return }
     try {
         $directory = Initialize-ManagerDataDirectory
+        Assert-NoReparsePath (Join-Path $directory 'manager.log')
         $line = '{0:u} [{1}] {2}' -f (Get-Date), $Level, ($Message -replace "[\r\n]+", ' ')
         Add-Content -LiteralPath (Join-Path $directory 'manager.log') -Value $line -Encoding UTF8
     }
@@ -89,7 +117,10 @@ function Write-ManagerLog {
 
 function Read-JsonFile {
     param([Parameter(Mandatory = $true)][string]$Path)
+    Assert-NoReparsePath $Path
+    if ((Test-Path -LiteralPath $Path) -and -not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "State path is not a file: $Path" }
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    if ((Get-Item -LiteralPath $Path -Force).Length -gt 1048576) { throw "State file is unexpectedly large: $Path" }
     try {
         return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
     }
@@ -104,6 +135,7 @@ function Write-JsonFileAtomic {
         [Parameter(Mandatory = $true)][object]$Value
     )
     $directory = Split-Path -Parent $Path
+    Assert-NoReparsePath $Path
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
@@ -122,9 +154,41 @@ function Write-JsonFileAtomic {
 
 function Remove-ManagerStateFile {
     param([Parameter(Mandatory = $true)][string]$Path)
+    Assert-NoReparsePath $Path
     if (Test-Path -LiteralPath $Path) {
         Remove-Item -LiteralPath $Path -Force
     }
+}
+
+function Protect-ManagerTemporaryDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $resolved = Normalize-WindowsPath $Path
+    $temporaryRoot = Normalize-WindowsPath ([IO.Path]::GetTempPath())
+    if (-not (Test-WindowsPathEqual (Split-Path -Parent $resolved) $temporaryRoot) -or
+        [IO.Path]::GetFileName($resolved) -notmatch '^SpicetifySpotifyManager(?:-install|-cli)?-[0-9a-f]{32}$') {
+        throw "Refusing to protect an unexpected temporary directory: '$resolved'."
+    }
+    $item = Get-Item -LiteralPath $resolved -Force
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The manager temporary path is not a normal directory: '$resolved'."
+    }
+    $sid = New-Object Security.Principal.SecurityIdentifier((Get-CurrentUserSid))
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetOwner($sid)
+    $acl.SetAccessRuleProtection($true, $false)
+    $rights = [Security.AccessControl.FileSystemRights]::FullControl
+    $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, $rights, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+    [void]$acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $resolved -AclObject $acl
+    $verified = Get-Acl -LiteralPath $resolved
+    $expectedDacl = Get-ComparableAccessSddl $acl
+    $actualDacl = Get-ComparableAccessSddl $verified
+    $actualOwner = $verified.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if (-not $verified.AreAccessRulesProtected -or $actualOwner -ne $sid.Value -or $actualDacl -ne $expectedDacl) {
+        throw "The manager could not protect its temporary directory: '$resolved'."
+    }
+    return $resolved
 }
 
 function Remove-ManagerTemporaryDirectory {
@@ -133,10 +197,29 @@ function Remove-ManagerTemporaryDirectory {
     $resolved = Normalize-WindowsPath $Path
     $temporaryRoot = Normalize-WindowsPath ([IO.Path]::GetTempPath())
     $name = [IO.Path]::GetFileName($resolved)
-    if (-not (Test-WindowsPathWithin $resolved $temporaryRoot) -or $name -notmatch '^SpicetifySpotifyManager(?:-install)?-[0-9a-f]{32}$') {
+    if (-not (Test-WindowsPathEqual (Split-Path -Parent $resolved) $temporaryRoot) -or $name -notmatch '^SpicetifySpotifyManager(?:-install|-cli)?-[0-9a-f]{32}$') {
         throw "Refusing to remove an unexpected temporary directory: '$resolved'."
     }
-    Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction SilentlyContinue
+    $item = Get-Item -LiteralPath $resolved -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        [IO.Directory]::Delete($resolved)
+        return
+    }
+    if (-not $item.PSIsContainer) { throw "Refusing to remove a temporary path that is not a directory: '$resolved'." }
+    function Remove-TemporaryChild {
+        param([string]$Child)
+        if (-not (Test-WindowsPathWithin $Child $resolved)) { throw 'Temporary cleanup escaped its validated directory.' }
+        $entry = Get-Item -LiteralPath $Child -Force
+        if ($entry.PSIsContainer) {
+            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                foreach ($nested in @(Get-ChildItem -LiteralPath $Child -Force)) { Remove-TemporaryChild $nested.FullName }
+            }
+            [IO.Directory]::Delete($Child)
+        }
+        else { [IO.File]::Delete($Child) }
+    }
+    try { Remove-TemporaryChild $resolved }
+    catch { Write-Warning "Temporary cleanup could not finish for '$resolved': $($_.Exception.Message)" }
 }
 
 function Normalize-WindowsPath {
@@ -150,6 +233,21 @@ function Normalize-WindowsPath {
         $fullPath = $fullPath.Substring(0, $fullPath.Length - 1)
     }
     return $fullPath.Replace('/', '\')
+}
+
+function Get-PublicCliAction {
+    param([AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments)
+    if ($Arguments.Count -eq 0) { return 'Menu' }
+    if ($Arguments.Count -eq 1) {
+        switch -CaseSensitive ($Arguments[0]) {
+            '--help' { return 'Help' }
+            '-h' { return 'Help' }
+            '--version' { return 'Version' }
+            '-V' { return 'Version' }
+            '--status' { return 'Status' }
+        }
+    }
+    return 'Invalid'
 }
 
 function Test-WindowsPathEqual {
@@ -271,6 +369,7 @@ function Assert-SafeUpdateDirectory {
     if (-not (Test-WindowsPathWithin $actualUpdate $expectedLocal)) {
         throw 'Safety check refused a path outside the intended Spotify local directory.'
     }
+    Assert-NoReparsePath $actualUpdate
     if (Test-Path -LiteralPath $actualUpdate) {
         $item = Get-Item -LiteralPath $actualUpdate -Force
         if (-not $item.PSIsContainer) { throw "The Spotify Update path exists but is not a directory: '$actualUpdate'." }
@@ -288,6 +387,22 @@ function Assert-SafeUpdateDirectory {
     return $actualUpdate
 }
 
+function Assert-NoReparsePath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $current = Normalize-WindowsPath $Path
+    while (-not [string]::IsNullOrEmpty($current)) {
+        $attributes = 0
+        try { $attributes = [IO.File]::GetAttributes($current) }
+        catch [IO.FileNotFoundException] { }
+        catch [IO.DirectoryNotFoundException] { }
+        # Permission and other I/O failures are not evidence that a path is safe.
+        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Safety check refused a reparse point or junction in '$Path': '$current'."
+        }
+        $current = Split-Path -Parent $current
+    }
+}
+
 function Get-DirectorySecurity {
     param([Parameter(Mandatory = $true)][string]$Path)
     if ($script:TestHooks.ContainsKey('GetDirectorySecurity')) {
@@ -296,21 +411,59 @@ function Get-DirectorySecurity {
     return Get-Acl -LiteralPath $Path
 }
 
+function Initialize-DirectoryAclApi {
+    if (-not (Get-Command Open-BoundDirectoryAclSession -ErrorAction SilentlyContinue)) {
+        $source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script:DirectoryAclSourceBase64))
+        . ([scriptblock]::Create($source))
+    }
+}
+
 function Set-DirectorySecurity {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)]$Acl
     )
-    if ($script:TestHooks.ContainsKey('SetDirectorySecurity')) {
-        Invoke-ManagerHook 'SetDirectorySecurity' @($Path, $Acl) | Out-Null
-        return
+    try {
+        if ($script:TestHooks.ContainsKey('SetDirectorySecurity')) {
+            Invoke-ManagerHook 'SetDirectorySecurity' @($Path, $Acl) | Out-Null
+            return
+        }
+        $context = Get-SpotifyContext
+        $safePath = Assert-SafeUpdateDirectory -Context $context
+        if (-not (Test-WindowsPathEqual $Path $safePath)) { throw 'The ACL write target differs from the validated Spotify Update path.' }
+        Initialize-DirectoryAclApi
+        $session = Open-BoundDirectoryAclSession $safePath
+        try {
+            $session.Write($Acl)
+            $verified = $session.Read()
+            if ((Get-ComparableAccessSddl $verified) -ne (Get-ComparableAccessSddl $Acl)) {
+                throw 'The bound Spotify Update ACL write could not be verified.'
+            }
+        }
+        finally { $session.Dispose() }
     }
-    Set-Acl -LiteralPath $Path -AclObject $Acl
+    catch {
+        if ($script:PermitAclElevation -and -not (Test-IsAdministrator) -and (Test-PermissionFailure $_)) {
+            Write-ManagerMessage 'Windows denied this exact ACL write. Administrator permission is required only for its integrity-checked helper retry.' 'Warning'
+            Invoke-ElevatedAclSet -Path $Path -Acl $Acl -Action $script:AclElevationAction
+            return
+        }
+        throw
+    }
 }
 
 function Get-AclSddl {
     param([Parameter(Mandatory = $true)]$Acl)
     return $Acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+}
+
+function Get-ComparableAccessSddl {
+    param([Parameter(Mandatory = $true)]$Acl)
+    $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor($Acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))
+    # Windows may mark a persisted DACL auto-inherited without changing any ACE.
+    # Keep protection, ACE order, rights and inheritance flags in the comparison.
+    $descriptor.SetFlags($descriptor.ControlFlags -band (-bnot [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited))
+    return $descriptor.GetSddlForm([Security.AccessControl.AccessControlSections]::Access)
 }
 
 function Get-AclFingerprint {
@@ -731,53 +884,219 @@ function Invoke-AllowUpdatesCore {
 
 function Test-PermissionFailure {
     param([Parameter(Mandatory = $true)]$ErrorRecord)
+    if ($null -eq $ErrorRecord) { return $false }
+    $permissionCategories = @(
+        [Management.Automation.ErrorCategory]::PermissionDenied,
+        [Management.Automation.ErrorCategory]::SecurityError
+    )
+    if ($null -ne $ErrorRecord.CategoryInfo -and $permissionCategories -contains $ErrorRecord.CategoryInfo.Category) {
+        return $true
+    }
+    $fullyQualifiedId = [string]$ErrorRecord.FullyQualifiedErrorId
+    if (-not [string]::IsNullOrWhiteSpace($fullyQualifiedId)) {
+        $identifier = $fullyQualifiedId.Split(',')[0]
+        if ($identifier -in @('UnauthorizedAccess', 'UnauthorizedAccessException', 'System.UnauthorizedAccessException', 'SecurityException', 'System.Security.SecurityException', 'PermissionDenied', 'SecurityError', 'SetAcl_AccessError')) {
+            return $true
+        }
+    }
+    if ($null -ne $ErrorRecord.CategoryInfo -and [string]$ErrorRecord.CategoryInfo.Reason -in @('UnauthorizedAccessException', 'SecurityException')) {
+        return $true
+    }
     $exception = $ErrorRecord.Exception
-    if ($exception -is [UnauthorizedAccessException] -or $exception -is [Security.SecurityException]) { return $true }
-    return $exception.Message -match '(?i)access.+denied|privilege'
+    $depth = 0
+    while ($null -ne $exception -and $depth -lt 16) {
+        if ($exception -is [UnauthorizedAccessException] -or $exception -is [Security.SecurityException]) { return $true }
+        if ($exception -is [ComponentModel.Win32Exception] -and $exception.NativeErrorCode -in @(5, 1300, 1314)) { return $true }
+        $hresultBytes = [BitConverter]::GetBytes([int]$exception.HResult)
+        $hresult = [BitConverter]::ToUInt32($hresultBytes, 0)
+        if ($hresult -in @([uint32]2147942405, [uint32]2147943700, [uint32]2147943714)) { return $true }
+        $exception = $exception.InnerException
+        $depth++
+    }
+    return $false
 }
 
-function Get-EmbeddedManagerSource {
-    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath) -and (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
-        return [IO.File]::ReadAllText($PSCommandPath)
-    }
-    $releasePath = [Environment]::GetEnvironmentVariable('SPICETIFY_MANAGER_SCRIPT')
-    if ([string]::IsNullOrWhiteSpace($releasePath) -or -not (Test-Path -LiteralPath $releasePath -PathType Leaf)) {
-        throw 'The manager source could not be located for the elevated ACL retry.'
-    }
-    $content = [IO.File]::ReadAllText($releasePath)
-    $marker = '# <' + 'SPICETIFY_MANAGER_POWERSHELL>'
-    $index = $content.IndexOf($marker, [StringComparison]::Ordinal)
-    if ($index -lt 0) { throw 'The embedded PowerShell marker could not be found for the elevated ACL retry.' }
-    return $content.Substring($index + $marker.Length).TrimStart([char]13, [char]10)
+function ConvertTo-PowerShellSingleQuotedContent {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+    return $Value.Replace("'", "''")
 }
 
-function Invoke-ElevatedAclRetry {
-    param([ValidateSet('Block', 'Allow', 'AllowForce')][string]$Action)
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($algorithm.ComputeHash($Bytes))).Replace('-', '')
+    }
+    finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Get-ElevatedAclHelperTemplate {
+    $bytes = [Convert]::FromBase64String($script:ElevatedAclHelperTemplateBase64)
+    $utf8 = New-Object Text.UTF8Encoding($false, $true)
+    return $utf8.GetString($bytes)
+}
+
+function New-ElevatedAclHelperSource {
+    param(
+        [ValidateSet('Block', 'Allow', 'AllowForce')][string]$Action,
+        [Parameter(Mandatory = $true)][string]$ResultPath,
+        [Parameter(Mandatory = $true)][string]$TargetPath,
+        [Parameter(Mandatory = $true)]$Acl,
+        [Parameter(Mandatory = $true)][string]$OperationId
+    )
+    $source = Get-ElevatedAclHelperTemplate
+    $replacements = [ordered]@{
+        '__SSM_ELEVATED_ACTION__' = $Action
+        '__SSM_ELEVATED_RESULT_PATH__' = $ResultPath
+        '__SSM_ELEVATED_TARGET_PATH__' = $TargetPath
+        '__SSM_ELEVATED_TARGET_SDDL__' = Get-AclSddl $Acl
+        '__SSM_ELEVATED_OPERATION_ID__' = $OperationId
+    }
+    foreach ($entry in $replacements.GetEnumerator()) {
+        if ([regex]::Matches($source, [regex]::Escape($entry.Key)).Count -ne 1) {
+            throw "The elevated ACL helper template marker is invalid: $($entry.Key)."
+        }
+        $source = $source.Replace($entry.Key, (ConvertTo-PowerShellSingleQuotedContent ([string]$entry.Value)))
+    }
+    if ($source -match '__SSM_ELEVATED_[A-Z_]+__') { throw 'An elevated ACL helper marker remains unresolved.' }
+    $tokens = $null
+    $errors = $null
+    [void][Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+    if (@($errors).Count -ne 0) { throw "The generated elevated ACL helper does not parse: $($errors[0].Message)" }
+    return $source
+}
+
+function New-ElevatedBootstrapSource {
+    param(
+        [ValidateSet('Block', 'Allow', 'AllowForce')][string]$Action,
+        [Parameter(Mandatory = $true)][string]$ResultPath,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9A-F]{64}$')][string]$ExpectedHash
+    )
+    $template = @'
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2.0
+$action = '__SSM_BOOTSTRAP_ACTION__'
+$resultPath = '__SSM_BOOTSTRAP_RESULT_PATH__'
+$expectedHash = '__SSM_BOOTSTRAP_HASH__'
+$directory = [IO.Path]::GetFullPath((Split-Path -Parent $resultPath)).TrimEnd('\')
+$temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+if (-not [string]::Equals((Split-Path -Parent $directory), $temporaryRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'The helper directory is outside the Windows temporary directory.' }
+if ([IO.Path]::GetFileName($directory) -notmatch '^SpicetifySpotifyManager-[0-9a-f]{32}$') { throw 'The helper directory name is invalid.' }
+$directoryItem = Get-Item -LiteralPath $directory -Force
+if (-not $directoryItem.PSIsContainer -or ($directoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'The helper directory is not a normal directory.' }
+if ([IO.Path]::GetFileName($resultPath) -ne 'result.json' -or -not [string]::Equals((Split-Path -Parent ([IO.Path]::GetFullPath($resultPath))), $directory, [StringComparison]::OrdinalIgnoreCase)) { throw 'The result path is invalid.' }
+if (Test-Path -LiteralPath $resultPath) { throw 'The result path already exists.' }
+$helperPath = Join-Path $directory 'acl-helper.ps1'
+$helperItem = Get-Item -LiteralPath $helperPath -Force
+if (($helperItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $helperItem.PSIsContainer -or $helperItem.Length -lt 1024 -or $helperItem.Length -gt 131072) { throw 'The helper payload is missing, unsafe, or has an invalid size.' }
+$helperBytes = [IO.File]::ReadAllBytes($helperPath)
+$sha256 = [Security.Cryptography.SHA256]::Create()
+try { $actualHash = ([BitConverter]::ToString($sha256.ComputeHash($helperBytes))).Replace('-', '') } finally { $sha256.Dispose() }
+if (-not [string]::Equals($actualHash, $expectedHash, [StringComparison]::OrdinalIgnoreCase)) { throw 'The elevated ACL helper integrity check failed.' }
+$utf8 = New-Object Text.UTF8Encoding($false, $true)
+$helperText = $utf8.GetString($helperBytes)
+$helperScriptBlock = [scriptblock]::Create($helperText)
+& $helperScriptBlock -Action $action -ResultPath $resultPath -HelperHash $actualHash
+'@
+    return $template.Replace('__SSM_BOOTSTRAP_ACTION__', (ConvertTo-PowerShellSingleQuotedContent $Action)).Replace('__SSM_BOOTSTRAP_RESULT_PATH__', (ConvertTo-PowerShellSingleQuotedContent $ResultPath)).Replace('__SSM_BOOTSTRAP_HASH__', $ExpectedHash)
+}
+
+function Start-ElevatedAclProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$EncodedCommand,
+        [Parameter(Mandatory = $true)][string]$TemporaryRoot,
+        [ValidateSet('Block', 'Allow', 'AllowForce')][string]$Action,
+        [Parameter(Mandatory = $true)][string]$TargetPath,
+        [Parameter(Mandatory = $true)]$Acl,
+        [Parameter(Mandatory = $true)][string]$ExpectedHash,
+        [Parameter(Mandatory = $true)][string]$OperationId
+    )
+    if ($script:TestHooks.ContainsKey('ElevatedProcess')) {
+        return Invoke-ManagerHook 'ElevatedProcess' @($EncodedCommand, $TemporaryRoot, $Action, $TargetPath, $Acl, $ExpectedHash, $OperationId)
+    }
+    $powerShell = Join-Path $PSHOME 'powershell.exe'
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $powerShell
+    $startInfo.Arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + $EncodedCommand
+    $startInfo.UseShellExecute = $true
+    $startInfo.Verb = 'runas'
+    $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Normal
+    try {
+        $process = [Diagnostics.Process]::Start($startInfo)
+        $process.WaitForExit()
+        return [pscustomobject]@{ ExitCode = $process.ExitCode }
+    }
+    catch [ComponentModel.Win32Exception] {
+        if ($_.Exception.NativeErrorCode -eq 1223) { throw 'Administrator permission was cancelled. No elevated ACL change was completed.' }
+        throw "The elevated ACL helper could not start. $($_.Exception.Message)"
+    }
+}
+
+function Read-VerifiedElevatedResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$TemporaryRoot,
+        [ValidateSet('Block', 'Allow', 'AllowForce')][string]$Action,
+        [Parameter(Mandatory = $true)][string]$TargetPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedHash,
+        [Parameter(Mandatory = $true)][string]$OperationId
+    )
+    $expectedPath = Normalize-WindowsPath (Join-Path $TemporaryRoot 'result.json')
+    if (-not (Test-WindowsPathEqual $Path $expectedPath) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'The elevated ACL helper did not return its expected result file.'
+    }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -le 0 -or $item.Length -gt 32768) {
+        throw 'The elevated ACL helper result file is unsafe or has an invalid size.'
+    }
+    $result = Read-JsonFile $Path
+    foreach ($name in @('SchemaVersion', 'OperationId', 'Action', 'TargetPath', 'HelperHash', 'Success', 'Changed', 'Message')) {
+        if ($null -eq $result.PSObject.Properties[$name]) { throw "The elevated ACL result is missing '$name'." }
+    }
+    if ([int]$result.SchemaVersion -ne 1 -or [string]$result.OperationId -ne $OperationId -or
+        [string]$result.Action -ne $Action -or -not (Test-WindowsPathEqual ([string]$result.TargetPath) $TargetPath) -or
+        -not [string]::Equals([string]$result.HelperHash, $ExpectedHash, [StringComparison]::OrdinalIgnoreCase) -or
+        $result.Success -isnot [bool] -or $result.Changed -isnot [bool] -or
+        [string]::IsNullOrWhiteSpace([string]$result.Message)) {
+        throw 'The elevated ACL helper returned malformed or mismatched result data.'
+    }
+    return $result
+}
+
+function Invoke-ElevatedAclSet {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Acl,
+        [ValidateSet('Block', 'Allow', 'AllowForce')][string]$Action
+    )
+    $context = Get-SpotifyContext
+    Assert-StandaloneSpotifySupported $context
+    $safePath = Assert-SafeUpdateDirectory -Context $context
+    if (-not (Test-WindowsPathEqual $Path $safePath)) { throw 'The elevated ACL target differs from the validated Spotify Update path.' }
+    $operationId = [guid]::NewGuid().ToString('N')
     $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('SpicetifySpotifyManager-{0}' -f [guid]::NewGuid().ToString('N'))
-    $sourcePath = Join-Path $temporaryRoot 'manager-elevated.ps1'
+    $sourcePath = Join-Path $temporaryRoot 'acl-helper.ps1'
     $resultPath = Join-Path $temporaryRoot 'result.json'
     try {
         New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
-        [IO.File]::WriteAllText($sourcePath, (Get-EmbeddedManagerSource), (New-Object Text.UTF8Encoding($false)))
-        $powerShell = Join-Path $PSHOME 'powershell.exe'
-        $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $sourcePath), '-ElevatedAclAction', $Action, '-ElevatedResultPath', ('"{0}"' -f $resultPath)) -join ' '
-        try {
-            $startInfo = New-Object Diagnostics.ProcessStartInfo
-            $startInfo.FileName = $powerShell
-            $startInfo.Arguments = $arguments
-            $startInfo.UseShellExecute = $true
-            $startInfo.Verb = 'runas'
-            $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Normal
-            $process = [Diagnostics.Process]::Start($startInfo)
-            $process.WaitForExit()
+        $temporaryRoot = Protect-ManagerTemporaryDirectory $temporaryRoot
+        $helperSource = New-ElevatedAclHelperSource -Action $Action -ResultPath $resultPath -TargetPath $safePath -Acl $Acl -OperationId $operationId
+        $helperBytes = (New-Object Text.UTF8Encoding($false)).GetBytes($helperSource)
+        $expectedHash = Get-Sha256Hex $helperBytes
+        [IO.File]::WriteAllBytes($sourcePath, $helperBytes)
+        $sourceItem = Get-Item -LiteralPath $sourcePath -Force
+        if (($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'The elevated helper payload became a reparse point.' }
+        if ($script:TestHooks.ContainsKey('BeforeElevatedProcess')) {
+            Invoke-ManagerHook 'BeforeElevatedProcess' @($temporaryRoot, $sourcePath, $resultPath, $expectedHash, $operationId) | Out-Null
         }
-        catch {
-            throw "Administrator permission was not granted. $($_.Exception.Message)"
-        }
-        $result = Read-JsonFile $resultPath
-        if ($null -eq $result) { throw "The elevated ACL helper did not return a result (exit code $($process.ExitCode))." }
+        $bootstrap = New-ElevatedBootstrapSource -Action $Action -ResultPath $resultPath -ExpectedHash $expectedHash
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrap))
+        $process = Start-ElevatedAclProcess -EncodedCommand $encoded -TemporaryRoot $temporaryRoot -Action $Action -TargetPath $safePath -Acl $Acl -ExpectedHash $expectedHash -OperationId $operationId
+        $result = Read-VerifiedElevatedResult -Path $resultPath -TemporaryRoot $temporaryRoot -Action $Action -TargetPath $safePath -ExpectedHash $expectedHash -OperationId $operationId
+        if ([int]$process.ExitCode -ne 0 -and [bool]$result.Success) { throw "The elevated ACL helper reported success with exit code $($process.ExitCode)." }
         if (-not [bool]$result.Success) { throw [string]$result.Message }
-        return [pscustomobject]@{ Changed = [bool]$result.Changed; Message = [string]$result.Message }
     }
     finally {
         Remove-ManagerTemporaryDirectory $temporaryRoot
@@ -790,16 +1109,17 @@ function Invoke-UpdateAccessAction {
         [Parameter(Mandatory = $true)]$Context,
         [switch]$PermitElevation
     )
+    $previousPermit = $script:PermitAclElevation
+    $previousAction = $script:AclElevationAction
     try {
+        $script:PermitAclElevation = [bool]$PermitElevation
+        $script:AclElevationAction = $Action
         if ($Action -eq 'Block') { return Invoke-BlockUpdatesCore $Context }
         return Invoke-AllowUpdatesCore $Context -ForceRecovery:($Action -eq 'AllowForce')
     }
-    catch {
-        if ($PermitElevation -and -not (Test-IsAdministrator) -and (Test-PermissionFailure $_)) {
-            Write-ManagerMessage 'Windows denied the ACL operation. Administrator permission is required only for this retry.' 'Warning'
-            return Invoke-ElevatedAclRetry $Action
-        }
-        throw
+    finally {
+        $script:PermitAclElevation = $previousPermit
+        $script:AclElevationAction = $previousAction
     }
 }
 
@@ -1065,6 +1385,66 @@ function Repair-SpicetifyIfNeeded {
     return [pscustomobject]@{ Changed = $true; Message = 'Spicetify was reapplied and the resulting state was verified.' }
 }
 
+function Assert-OfficialInstallerUri {
+    param([Parameter(Mandatory = $true)][uri]$Uri)
+    if (-not $Uri.IsAbsoluteUri -or $Uri.Scheme -ne 'https' -or
+        -not [string]::Equals($Uri.Host, 'raw.githubusercontent.com', [StringComparison]::OrdinalIgnoreCase) -or
+        $Uri.AbsolutePath -ne '/spicetify/cli/main/install.ps1' -or
+        -not $Uri.IsDefaultPort -or -not [string]::IsNullOrEmpty($Uri.UserInfo) -or
+        -not [string]::IsNullOrWhiteSpace($Uri.Query) -or -not [string]::IsNullOrWhiteSpace($Uri.Fragment)) {
+        throw "Refusing an unexpected Spicetify installer address: '$Uri'."
+    }
+}
+
+function Test-OfficialSpicetifyInstallerContent {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content)
+    $byteCount = [Text.Encoding]::UTF8.GetByteCount($Content)
+    if ($byteCount -lt 4096 -or $byteCount -gt 131072) { return $false }
+    $trimmed = $Content.TrimStart([char]0xFEFF, [char]13, [char]10, [char]9, [char]32)
+    if ($trimmed.StartsWith('<') -or $trimmed.StartsWith('{') -or $trimmed -notmatch '^\$ErrorActionPreference\s*=\s*''Stop''') { return $false }
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($Content, [ref]$tokens, [ref]$errors)
+    if (@($errors).Count -ne 0) { return $false }
+    $functionNames = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object Name)
+    foreach ($requiredFunction in @('Test-Admin', 'Test-PowerShellVersion', 'Get-Spicetify', 'Add-SpicetifyToPath', 'Install-Spicetify')) {
+        if ($functionNames -notcontains $requiredFunction) { return $false }
+    }
+    foreach ($marker in @(
+        '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12',
+        '$spicetifyFolderPath = "$env:LOCALAPPDATA\spicetify"',
+        "Invoke-RestMethod -Uri 'https://api.github.com/repos/spicetify/cli/releases/latest'",
+        'https://github.com/spicetify/cli/releases/download/v$targetVersion/spicetify-$targetVersion-windows-$architecture.zip',
+        'Expand-Archive -Path $archivePath -DestinationPath $spicetifyFolderPath -Force'
+    )) {
+        if (-not $Content.Contains($marker)) { return $false }
+    }
+    return $true
+}
+
+function Assert-OfficialInstallerResponse {
+    param([Parameter(Mandatory = $true)]$Response)
+    if ($null -ne $Response.PSObject.Properties['StatusCode'] -and [int]$Response.StatusCode -ne 200) {
+        throw "The official installer request returned HTTP $($Response.StatusCode)."
+    }
+    if ($null -ne $Response.PSObject.Properties['Headers']) {
+        $contentType = [string]$Response.Headers['Content-Type']
+        if ($contentType -match '^(?i)text/html|application/(?:problem\+)?json') {
+            throw "The official installer returned an unexpected content type: '$contentType'."
+        }
+    }
+    $responseUri = $null
+    if ($null -ne $Response.PSObject.Properties['BaseResponse'] -and $null -ne $Response.BaseResponse -and
+        $null -ne $Response.BaseResponse.PSObject.Properties['ResponseUri']) {
+        $responseUri = $Response.BaseResponse.ResponseUri
+    }
+    elseif ($null -ne $Response.PSObject.Properties['BaseResponse'] -and $null -ne $Response.BaseResponse -and
+        $null -ne $Response.BaseResponse.PSObject.Properties['RequestMessage'] -and $null -ne $Response.BaseResponse.RequestMessage) {
+        $responseUri = $Response.BaseResponse.RequestMessage.RequestUri
+    }
+    if ($null -ne $responseUri) { Assert-OfficialInstallerUri ([uri]$responseUri) }
+}
+
 function Install-OrUpdateSpicetify {
     param([Parameter(Mandatory = $true)]$Context)
     if (Test-IsAdministrator) {
@@ -1084,12 +1464,19 @@ function Install-OrUpdateSpicetify {
     $installerPath = Join-Path $temporaryDirectory 'install.ps1'
     try {
         New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        $temporaryDirectory = Protect-ManagerTemporaryDirectory $temporaryDirectory
+        Assert-OfficialInstallerUri ([uri]$script:OfficialInstallerUrl)
         Write-ManagerMessage 'Downloading the official Spicetify installer from github.com/spicetify/cli...' 'Info'
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -UseBasicParsing -Uri $script:OfficialInstallerUrl -OutFile $installerPath
-        $installer = Get-Content -LiteralPath $installerPath -Raw -Encoding UTF8
-        if ($installer.Length -lt 1000 -or $installer -notmatch 'spicetify') {
-            throw 'The downloaded official installer did not pass the basic content check.'
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $script:OfficialInstallerUrl -MaximumRedirection 3 -OutFile $installerPath -PassThru -ErrorAction Stop
+        Assert-OfficialInstallerResponse $response
+        $installerItem = Get-Item -LiteralPath $installerPath -Force
+        if (($installerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $installerItem.Length -lt 4096 -or $installerItem.Length -gt 131072) {
+            throw 'The downloaded official installer has an unsafe type or unexpected size.'
+        }
+        $installer = [IO.File]::ReadAllText($installerPath, (New-Object Text.UTF8Encoding($false, $true)))
+        if (-not (Test-OfficialSpicetifyInstallerContent $installer)) {
+            throw 'The downloaded file did not match the expected structure of the official Spicetify installer.'
         }
         $result = Invoke-InteractiveProcess -FilePath (Join-Path $PSHOME 'powershell.exe') -Arguments @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installerPath)
         if ($result.ExitCode -ne 0) {
@@ -1099,8 +1486,13 @@ function Install-OrUpdateSpicetify {
     finally {
         Remove-ManagerTemporaryDirectory $temporaryDirectory
     }
-    if ([string]::IsNullOrWhiteSpace((Find-SpicetifyExecutable))) {
+    $installedExecutable = Find-SpicetifyExecutable
+    if ([string]::IsNullOrWhiteSpace($installedExecutable)) {
         throw 'The official installer completed, but spicetify.exe could not be found.'
+    }
+    $verification = Invoke-CapturedProcess -FilePath $installedExecutable -Arguments @('-v')
+    if ($verification.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($verification.Output)) {
+        throw 'The official installer completed, but the installed Spicetify executable did not pass its version check.'
     }
     return [pscustomobject]@{ Changed = $true; Message = 'Spicetify CLI was installed from the official Spicetify repository and verified.' }
 }
@@ -1145,6 +1537,65 @@ function Show-ManagerStatus {
     Write-Host ('  Updates:    {0}' -f $Status.Updates.State)
     if ($Status.Updates.State -eq 'Recovery required') {
         Write-Host ('              {0}' -f $Status.Updates.Detail) -ForegroundColor Yellow
+    }
+}
+
+function Write-ManagerHelp {
+    param([switch]$ErrorStream)
+    $text = @"
+Usage: Spicetify-Spotify-Manager.exe [option]
+
+Options:
+  --help, -h       Show this help text.
+  --version, -V    Show the manager version.
+  --status         Print the current read-only status.
+
+With no option, the manager opens its interactive menu.
+
+Exit codes:
+  0   The command completed successfully.
+  3   Status completed, but supported standalone Spotify was not found.
+  64  The command-line arguments were not valid.
+  70  An operational or status error occurred.
+"@.TrimEnd()
+    if ($ErrorStream) { [Console]::Error.WriteLine($text) } else { [Console]::Out.WriteLine($text) }
+}
+
+function Write-CommandLineStatus {
+    $script:ReadOnlyMode = $true
+    $context = Get-SpotifyContext
+    $status = Get-ManagerStatus $context
+    $spotifyText = if ($status.StandaloneInstalled) {
+        $version = if ([string]::IsNullOrWhiteSpace($status.SpotifyVersion)) { 'version unknown' } else { $status.SpotifyVersion }
+        "Standalone installed ($version), " + $(if ($status.SpotifyRunning) { 'running' } else { 'closed' })
+    }
+    elseif ($status.StoreInstalled) { 'Microsoft Store version only (unsupported)' }
+    else { 'Not found' }
+    $spicetifyText = if ($status.Spicetify.Installed) { "$($status.Spicetify.Version), $($status.Spicetify.AppsState)" } else { 'Not installed' }
+    [Console]::Out.WriteLine(('{0} {1}' -f $script:ManagerName, $script:ManagerVersion))
+    [Console]::Out.WriteLine('Current status')
+    [Console]::Out.WriteLine(('  Spotify:    {0}' -f $spotifyText))
+    if ($status.StandaloneInstalled -and $status.StoreInstalled) {
+        [Console]::Out.WriteLine('  Store app:  Also installed; it will not be modified.')
+    }
+    [Console]::Out.WriteLine(('  Spicetify:  {0}' -f $spicetifyText))
+    [Console]::Out.WriteLine(('  Updates:    {0}' -f $status.Updates.State))
+    if ($status.Updates.State -eq 'Recovery required') { [Console]::Out.WriteLine(('              {0}' -f $status.Updates.Detail)) }
+    if ($status.StandaloneInstalled) { return 0 }
+    return 3
+}
+
+function Invoke-CommandLineAction {
+    param([ValidateSet('Help', 'Version', 'Status', 'Invalid')][string]$Action)
+    switch ($Action) {
+        'Help' { Write-ManagerHelp; return 0 }
+        'Version' { [Console]::Out.WriteLine(('{0} {1}' -f $script:ManagerName, $script:ManagerVersion)); return 0 }
+        'Status' { return Write-CommandLineStatus }
+        default {
+            [Console]::Error.WriteLine('ERROR: Unknown or conflicting command-line arguments.')
+            Write-ManagerHelp -ErrorStream
+            return 64
+        }
     }
 }
 
@@ -1302,6 +1753,7 @@ function Resolve-GuidedRecovery {
                 if ([bool]$state.RestoreRunning -and -not (Test-SpotifyRunning $Context)) { Start-StandaloneSpotify $Context }
             }
         }
+        else { throw 'Guided recovery was deferred. Its saved preferences have been retained.' }
     }
     $currentlyRunning = Test-SpotifyRunning $Context
     $shouldBeRunning = [bool]$state.RestoreRunning
@@ -1312,6 +1764,7 @@ function Resolve-GuidedRecovery {
             if ($shouldBeRunning) { Start-StandaloneSpotify $Context }
             else { Stop-StandaloneSpotify $Context | Out-Null }
         }
+        else { throw 'Guided recovery was deferred. Its saved preferences have been retained.' }
     }
     Remove-ManagerStateFile $path
 }
@@ -1425,41 +1878,26 @@ function Show-MainMenu {
     }
 }
 
-function Write-ElevatedResult {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][bool]$Success,
-        [bool]$Changed = $false,
-        [Parameter(Mandatory = $true)][string]$Message
-    )
-    Write-JsonFileAtomic -Path $Path -Value ([ordered]@{ Success = $Success; Changed = $Changed; Message = $Message })
-}
-
 if ($env:SPICETIFY_MANAGER_TEST_MODE -eq '1') {
     Write-Host 'SELFTEST OK'
-    return
-}
-
-if (-not [string]::IsNullOrWhiteSpace($ElevatedAclAction)) {
-    if ([string]::IsNullOrWhiteSpace($ElevatedResultPath)) { throw 'The elevated ACL helper requires a result path.' }
-    try {
-        $context = Get-SpotifyContext
-        $result = if ($ElevatedAclAction -eq 'Block') {
-            Invoke-BlockUpdatesCore $context
-        }
-        else {
-            Invoke-AllowUpdatesCore $context -ForceRecovery:($ElevatedAclAction -eq 'AllowForce')
-        }
-        Write-ElevatedResult -Path $ElevatedResultPath -Success $true -Changed ([bool]$result.Changed) -Message ([string]$result.Message)
-    }
-    catch {
-        Write-ElevatedResult -Path $ElevatedResultPath -Success $false -Message $_.Exception.Message
-        throw
-    }
+    [Console]::Out.WriteLine('SELFTEST ENGINE ' + $PSVersionTable.PSVersion.ToString())
+    [Console]::Out.WriteLine('SELFTEST POWERSHELL AVAILABLE ' + (Test-Path -LiteralPath (Join-Path $PSHOME 'powershell.exe') -PathType Leaf))
+    # Read-only test evidence comes from the bound PowerShell parameter, not a
+    # separately parsed copy in the launcher. No argument is evaluated as code.
+    $jsonArguments = ConvertTo-Json -InputObject $NativeArguments -Compress
+    [Console]::Out.WriteLine('SELFTEST ARGUMENTS ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($jsonArguments)))
     return
 }
 
 if (-not $NoMain) {
+    if ([string]::IsNullOrWhiteSpace($CliAction)) { $CliAction = Get-PublicCliAction -Arguments $NativeArguments }
+    if ($CliAction -ne 'Menu') {
+        try { exit (Invoke-CommandLineAction $CliAction) }
+        catch {
+            [Console]::Error.WriteLine("ERROR: $($_.Exception.Message)")
+            exit 70
+        }
+    }
     try {
         Show-MainMenu
     }
