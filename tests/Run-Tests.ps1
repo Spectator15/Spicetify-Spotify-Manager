@@ -67,8 +67,10 @@ function New-TestRoot {
     New-Item -ItemType Directory -Path $root | Out-Null
     # Isolate fixtures from the host TEMP ACL (the sandbox has a separate SID).
     $acl = Get-Acl -LiteralPath $root
+    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl.SetOwner($userSid)
     $acl.SetAccessRuleProtection($true, $false)
-    foreach ($sidValue in @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544')) {
+    foreach ($sidValue in @($userSid.Value, 'S-1-5-18', 'S-1-5-32-544')) {
         $sid = New-Object Security.Principal.SecurityIdentifier($sidValue)
         $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
         [void]$acl.AddAccessRule($rule)
@@ -107,6 +109,17 @@ function Use-TestEnvironment {
         [Parameter(Mandatory = $true)]$Context,
         [hashtable]$ExtraHooks = @{}
     )
+    $directory = Join-Path $Root 'Manager Data'
+    if (-not (Test-Path -LiteralPath $directory)) {
+        # The hosted runner's token can default to Administrators as owner.
+        # Access-rule inheritance and the IsAdministrator hook do not change
+        # that token default. Establish the normal-user invariant explicitly,
+        # preserving the inherited DACL and never repairing an existing fixture.
+        New-Item -ItemType Directory -Path $directory | Out-Null
+        $acl = Get-Acl -LiteralPath $directory
+        $acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
+        Set-Acl -LiteralPath $directory -AclObject $acl
+    }
     $hooks = @{
         DataDirectory = { Join-Path $Root 'Manager Data' }.GetNewClosure()
         SpotifyContext = { $Context }.GetNewClosure()
@@ -291,6 +304,61 @@ function Invoke-Test {
 }
 
 try {
+    Invoke-Test 'current-user-owned state fixture is accepted by the production guard' {
+        $root = New-TestRoot
+        $context = New-TestContext -Root $root -Installed
+        Use-TestEnvironment $root $context
+        $directory = Get-ManagerDataDirectory
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        Assert-Equal $sid.Value (Get-Acl -LiteralPath $root).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        Assert-Equal $sid.Value (Get-Acl -LiteralPath $directory).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        $before = (Get-Acl -LiteralPath $directory).Sddl
+        Assert-SafeManagerDataDirectory
+        Assert-Equal $directory (Initialize-ManagerDataDirectory)
+        Use-TestEnvironment $root $context
+        Assert-Equal $before (Get-Acl -LiteralPath $directory).Sddl 'Fixture reuse changed an existing security descriptor.'
+    }
+
+    Invoke-Test 'wrong-owner state fixture is rejected by the unchanged production guard' {
+        $root = New-TestRoot
+        $context = New-TestContext -Root $root -Installed
+        Use-TestEnvironment $root $context
+        $directory = Get-ManagerDataDirectory
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $original = Get-Acl -LiteralPath $directory
+        $wrongOwnerAcl = Get-Acl -LiteralPath $directory
+        try {
+            if (-not $identity.Owner.Equals($identity.User)) {
+                # The hosted runner can assign its token's default group owner
+                # without requesting new privilege. Exercise a real wrong owner.
+                $wrongOwnerAcl.SetOwner($identity.Owner)
+                Set-Acl -LiteralPath $directory -AclObject $wrongOwnerAcl
+                try {
+                    Assert-Equal $identity.Owner.Value (Get-Acl -LiteralPath $directory).GetOwner([Security.Principal.SecurityIdentifier]).Value
+                    Use-TestEnvironment $root $context
+                    Assert-Throws { Assert-SafeManagerDataDirectory } 'Manager state directory has an unexpected owner'
+                }
+                finally { Set-Acl -LiteralPath $directory -AclObject $original }
+                Write-Host '      Wrong-owner regression used a real filesystem owner.'
+            }
+            else {
+                # Unelevated local tokens need not have permission to assign a
+                # different on-disk owner. Substitute only the ACL read, not the
+                # current SID or guard; request no elevation and change no file.
+                $alternate = @($identity.Groups | Where-Object { -not $_.Equals($identity.User) })[0]
+                $wrongOwnerAcl.SetOwner($alternate)
+                function Get-Acl {
+                    param([string]$LiteralPath)
+                    Assert-Equal $directory $LiteralPath
+                    return $wrongOwnerAcl
+                }
+                Assert-Throws { Assert-SafeManagerDataDirectory } 'Manager state directory has an unexpected owner'
+                Write-Host '      Wrong-owner regression used an ACL-read substitute; no foreign-owner privilege requested.'
+            }
+        }
+        finally { $identity.Dispose() }
+    }
+
     Invoke-Test 'detects standalone Spotify installed and missing' {
         $root = New-TestRoot
         $installed = New-TestContext -Root $root -Installed
@@ -614,9 +682,11 @@ try {
         $directory = Get-ManagerDataDirectory
         $outside = Join-Path $root 'Outside State'
         [void][IO.Directory]::CreateDirectory($outside)
+        [IO.Directory]::Delete($directory)
         New-Item -ItemType Junction -Path $directory -Target $outside | Out-Null
         try { Assert-Throws { Get-UpdateStateRecord } 'reparse point|junction' }
         finally { [IO.Directory]::Delete($directory) }
+        Use-TestEnvironment $root $context
         [void](Initialize-ManagerDataDirectory)
         $acl = Get-Acl -LiteralPath $directory
         $rule = New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-1-0')), 'Write', 'Allow')
