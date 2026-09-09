@@ -19,7 +19,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
-      - name: Verify generated release
+      - name: Inspect unchanged fixture ownership
+        # Temporary diagnostic branch only; production fixtures are unchanged.
+        shell: powershell
+        run: .\tests\Inspect-StateOwner.ps1
+
+      - name: Verify generated release bytes
         shell: powershell
         run: .\build\Build-Release.ps1 -Check
 
