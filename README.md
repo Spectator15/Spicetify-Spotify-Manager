@@ -224,7 +224,7 @@ shellcheck -x src/linux/core.sh src/linux/main.sh build/build-linux-release.sh t
 <details>
 <summary><b>Research references and credits</b></summary>
 
-I built this with help from ChatGPT, using the projects below as references for ideas and correct behaviour. No code was copied from them, and listing them doesn't imply endorsement.
+These projects were used as references for ideas and correct behaviour. No code was copied from them, and listing them doesn't imply endorsement.
 
 | Project | What I looked at |
 | --- | --- |
